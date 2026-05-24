@@ -22,10 +22,7 @@ from urllib.parse import urljoin
 import akshare as ak
 import pandas as pd
 import requests
-import urllib3
 from bs4 import BeautifulSoup
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if _project_root not in sys.path:
@@ -310,7 +307,7 @@ class NBSFetcher(BaseFetcher):
             'dfwds': json.dumps([{'wdcode': 'sj', 'valuecode': period}]),
             'k1': str(int(time.time() * 1000)),
         }
-        r = requests.get(NBS_API_URL, params=params, timeout=120, verify=False,
+        r = requests.get(NBS_API_URL, params=params, timeout=120,
                          headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'},
                          proxies=self._cn_proxies)
         data = self._nbs_json(r)
@@ -574,7 +571,7 @@ class NBSFetcher(BaseFetcher):
             ]),
             'k1': str(int(time.time() * 1000)),
         }
-        r = requests.get(NBS_API_URL, params=params, timeout=120, verify=False,
+        r = requests.get(NBS_API_URL, params=params, timeout=120,
                          headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'},
                          proxies=self._cn_proxies)
         data = self._nbs_json(r)

@@ -13,7 +13,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${PROJECT_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 LOG_FILE="${LOG_FILE:-$PROJECT_DIR/update.log}"
 VENV_DIR="${VENV_DIR:-$PROJECT_DIR/.venv}"
-PYTHON_BIN="$VENV_DIR/bin/python"
+PYTHON_BIN=""
 REQUIREMENTS_FILE="$PROJECT_DIR/requirements.txt"
 REQUIREMENTS_STAMP="$VENV_DIR/.requirements.stamp"
 FAILED=0
@@ -23,6 +23,18 @@ FETCH_SOURCES="${FETCH_SOURCES:-$DEFAULT_SOURCES}"
 
 log_message() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
+select_python_bin() {
+    if [ -x "$VENV_DIR/bin/python" ]; then
+        PYTHON_BIN="$VENV_DIR/bin/python"
+    elif [ -x "$VENV_DIR/Scripts/python.exe" ]; then
+        PYTHON_BIN="$VENV_DIR/Scripts/python.exe"
+    elif [ -x "$VENV_DIR/Scripts/python" ]; then
+        PYTHON_BIN="$VENV_DIR/Scripts/python"
+    else
+        PYTHON_BIN="$VENV_DIR/bin/python"
+    fi
 }
 
 requirements_need_install() {
@@ -41,6 +53,7 @@ requirements_need_install() {
 ensure_venv() {
     local bootstrap_python
 
+    select_python_bin
     if [ ! -x "$PYTHON_BIN" ]; then
         if command -v python3 >/dev/null 2>&1; then
             bootstrap_python="python3"
@@ -54,6 +67,12 @@ ensure_venv() {
         log_message "Creating virtual environment: $VENV_DIR"
         if ! "$bootstrap_python" -u -m venv "$VENV_DIR" 2>&1 | tee -a "$LOG_FILE"; then
             log_message "FAILED: could not create virtual environment"
+            exit 1
+        fi
+
+        select_python_bin
+        if [ ! -x "$PYTHON_BIN" ]; then
+            log_message "FAILED: virtual environment Python not found under $VENV_DIR"
             exit 1
         fi
     fi
