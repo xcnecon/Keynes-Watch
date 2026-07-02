@@ -843,14 +843,12 @@ class PBOCFetcher(BaseFetcher):
                 list_url = f'{pboc_base}{list_path}17081-{pboc_page}.html'
 
             try:
-                resp = self.session.get(
-                    list_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=20)
-                resp.encoding = 'utf-8'
+                html = self._get_pboc_html(list_url)
             except Exception as e:
                 self.logger.warning(f'  PBOC list page {pboc_page} failed: {e}')
                 break
 
-            soup = BeautifulSoup(resp.text, 'html.parser')
+            soup = BeautifulSoup(html, 'html.parser')
             links = soup.find_all('a', href=re.compile(r'/125475/\d+/index'))
             date_spans = soup.find_all('span', class_='hui12')
 
@@ -868,10 +866,8 @@ class PBOCFetcher(BaseFetcher):
                 href = link.get('href', '')
                 ann_url = f'{pboc_base}{href}'
                 try:
-                    resp2 = self.session.get(
-                        ann_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=20)
-                    resp2.encoding = 'utf-8'
-                    parsed = _parse_omo_html(BeautifulSoup(resp2.text, 'html.parser'))
+                    ann_html = self._get_pboc_html(ann_url)
+                    parsed = _parse_omo_html(BeautifulSoup(ann_html, 'html.parser'))
                     page_rows.extend(parsed)
                     self.rate_limit_pause(0.2)
                 except Exception as e:
@@ -1015,6 +1011,28 @@ class PBOCFetcher(BaseFetcher):
 
     # -- Helpers ----------------------------------------------------------------
 
+    def _sina_macro_sessions(self):
+        """Candidate sessions for the Sina macro API, most promising first.
+
+        Sina blocks some datacenter IPs (e.g. overseas servers) while the CN
+        proxy can fail independently, so keep both transports available:
+        direct connection first, CN-proxied session as fallback. The transport
+        that succeeded last is remembered and tried first on later pages.
+        """
+        if not hasattr(self, '_sina_direct_session'):
+            session = self._create_session()
+            session.trust_env = False
+            session.proxies = {}
+            self._sina_direct_session = session
+        sessions = [self._sina_direct_session]
+        if getattr(self, '_cn_proxies', None):
+            sessions.append(self.session)
+        preferred = getattr(self, '_sina_session_ok', None)
+        if preferred in sessions:
+            sessions.remove(preferred)
+            sessions.insert(0, preferred)
+        return sessions
+
     def _fetch_sina_macro_df(self, event, label, page_size=31):
         """Fetch a Sina macro table with proxy-aware, page-level retries."""
         with self._SINA_MACRO_LOCK:
@@ -1060,8 +1078,8 @@ class PBOCFetcher(BaseFetcher):
             'Referer': 'https://finance.sina.com.cn/mac/',
         }
 
-        def _call():
-            resp = self.session.get(
+        def _fetch_page(session):
+            resp = session.get(
                 self.SINA_MACRO_URL,
                 params=params,
                 headers=headers,
@@ -1077,6 +1095,17 @@ class PBOCFetcher(BaseFetcher):
                     f'unexpected Sina response for {label} offset {offset}: {snippet!r}'
                 )
             return demjson.decode(text[start:end + 1])
+
+        def _call():
+            last_exc = None
+            for session in self._sina_macro_sessions():
+                try:
+                    result = _fetch_page(session)
+                    self._sina_session_ok = session
+                    return result
+                except Exception as exc:
+                    last_exc = exc
+            raise last_exc
 
         return self.retry_call(
             _call,
