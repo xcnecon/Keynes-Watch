@@ -1,8 +1,35 @@
-# KeynesWatch Data Fetchers
+# Keynes Watch — Data Pipeline
 
-Open-source data collection programs for KeynesWatch macroeconomic dashboards at
-https://keyneswatch.com/.
-This repository contains only the fetcher code and safe configuration examples;
+This is the open-source ETL behind [keyneswatch.com](https://keyneswatch.com/),
+a free, auto-updating library of the macro data that rates and macro investors
+actually trade on:
+
+- **U.S. — Fed & money markets**: EFFR vs the target range, SOFR percentiles and
+  volume, NY Fed repo/reverse-repo operations, reserve balances scaled by GDP and
+  Fedwire volume, nominal and TIPS yield curves
+- **U.S. — Treasury supply & fiscal flows**: outstanding debt by instrument,
+  weighted average maturity and interest rates, the daily TGA balance, the debt
+  limit, and the Monthly Treasury Statement
+- **U.S. — Labor, in real time**: daily withheld income/payroll taxes (a
+  census-like wage-bill proxy weeks ahead of payrolls), CES payrolls, UI claims,
+  unemployment detail, Indeed posted wages and job postings
+- **U.S. — Profits & sectoral balances**: the Kalecki–Levy profits equation and
+  Godley-style three-sector balances, built quarterly from BEA NIPA
+- **China — PBOC & credit**: the rate corridor (SHIBOR/SLF/IOER/OMO), LPR, RRR,
+  money supply, the PBOC balance sheet, total social financing and new loans
+- **China — Property & land finance**: NBS real estate macro, 70-city house
+  prices, and MOF land transfer revenue
+
+Every series is pulled programmatically from primary sources — the NY Fed
+Markets API, Treasury Fiscal Data, BEA, FRED, PBOC, NBS, and MOF — never rekeyed
+from secondary aggregators, and refreshes automatically as new data are
+released.
+
+The site is built and maintained by [Chenning Xu](https://www.linkedin.com/in/chenning-xu/),
+a Hong Kong-based hedge fund research analyst covering global macro with a focus
+on rates ([email](mailto:chenningxuecon@gmail.com)).
+
+This repository contains the fetcher code and safe configuration examples;
 it does not include production secrets, logs, certificates, downloaded datasets,
 or server deployment files.
 
