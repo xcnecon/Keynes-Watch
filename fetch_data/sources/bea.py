@@ -118,6 +118,7 @@ class BEAFetcher(BaseFetcher):
                 _BASE_URL,
                 params=params,
                 headers=headers,
+                verify=False,
                 timeout=60,
             )
             resp.raise_for_status()

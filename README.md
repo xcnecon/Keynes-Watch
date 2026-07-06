@@ -17,6 +17,9 @@ actually trade on:
   Godley-style three-sector balances, built quarterly from BEA NIPA
 - **China — PBOC & credit**: the rate corridor (SHIBOR/SLF/IOER/OMO), LPR, RRR,
   money supply, the PBOC balance sheet, total social financing and new loans
+- **China — Economic activity**: total retail sales of consumer goods (monthly
+  since 1984) with urban/rural, catering/goods, 16 above-quota category and
+  online-retail splits
 - **China — Property & land finance**: NBS real estate macro, 70-city house
   prices, and MOF land transfer revenue
 - **China — Profits & sectoral balances**: the same Kalecki-equation and
@@ -49,7 +52,7 @@ The unified runner in `fetch_data/run.py` can update these source groups:
 | `treasury` | Nominal and real Treasury yield curves |
 | `indeed` | Indeed Hiring Lab wage and job-posting CSV snapshots |
 | `pboc` | PBOC LPR, money supply, social financing, credit, reserve ratios, SHIBOR, policy rates, balance sheet, OMO |
-| `nbs` | NBS China real estate climate, house prices, macro real estate indicators, and annual flow-of-funds accounts (via the NBS data-release-library API launched June 2026) |
+| `nbs` | NBS China real estate climate, house prices, macro real estate indicators, annual flow-of-funds accounts, and monthly retail sales of consumer goods (via the NBS data-release-library API launched June 2026, with official press-release fallback) |
 | `mof` | China Ministry of Finance land transfer revenue from monthly fiscal reports |
 
 Most sources write into MySQL tables and create those tables if they do not

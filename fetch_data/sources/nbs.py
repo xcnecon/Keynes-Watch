@@ -6,6 +6,7 @@ Series:
     nbs_house_price            70城住宅价格指数 — 汇总 + 分面积 (via NBS easyquery API, dbcode=csyd)
     nbs_real_estate_macro      全国房地产月度宏观数据 — 9大类 (via NBS easyquery API, dbcode=hgyd)
     cn_flow_of_funds           资金流量表（非金融交易）年度 1992+ (via NBS 新版数据发布库 API)
+    nbs_retail_sales           社会消费品零售总额月度 1984+ (via NBS 新版数据发布库 API + 官方新闻稿回退)
 
 Requires: pip install akshare lxml
 """
@@ -122,6 +123,243 @@ FOF_CORE_VARIABLES = [
     'hh_nfi', 'gov_nfi', 'nf_nfi', 'fin_nfi', 'row_nfi', 'gcf', 'ngdp',
 ]
 
+# ---------------------------------------------------------------------------
+# 社会消费品零售总额（月度库，via NBS 新版数据发布库 API）
+# 路径：月度数据 → 国内贸易 → 社会消费品零售总额（及兄弟叶子）
+# dp 口径：1=当期值→monthly_value, 11=同比→monthly_yoy,
+#          21=累计值→ytd_value, 12=累计增长→ytd_yoy（同比均为官方可比口径，
+#          与绝对值跨年自算不一致，只存公布值、永不自算）
+# 历史起点（实测）：total 当期值 1984-01（同比/累计 2000-01）、限上 2011、
+#   城乡/餐饮/商品 2010、限上分类 2010/2011、网零旧口径 2018-02～2025-12、
+#   新口径 2026-02 起（新旧口径不可比 → 独立 code 存，图上自然断链）
+# 1—2 月：2012 年起 1 月四值全空（不建行）、2 月仅累计两列（=1—2月合并值）
+# ---------------------------------------------------------------------------
+NBS_V2_MONTHLY_ROOT = 'fc982599aa684be7969d7b90b1bd0e84'  # 月度数据根目录 UUID
+
+# (indicator_code, 官方中文名, 叶子目录 cid, {表字段: 指标 iid})
+# 由 queryIndicatorsByCid 一次性枚举后固化（2026-07 实测）；跳过的概念：
+# 粮油食品饮料烟酒合计（=三子类加总）、服装类（服装鞋帽的子项）、
+# 网零吃/穿/用类（过细，仅累计增速）、网上服务零售额（=总额-商品）
+RETAIL_INDICATORS = [
+    ('total', '社会消费品零售总额', 'd0cb882c7f27443ab6b3ef9421901961', {
+        'monthly_value': '1142a3a03e9045959e606a21822641ac',
+        'monthly_yoy': 'aaac57d54d2e465d91bc9f3ea1a8618e',
+        'ytd_value': '260a1794443b43dd93a59928b12f38af',
+        'ytd_yoy': 'e3ca151b53d347b78d1e179e5ebf1d33',
+    }),
+    ('ls_total', '限上单位消费品零售额', 'd0cb882c7f27443ab6b3ef9421901961', {
+        'monthly_value': '97281ec401c14706a7509672902106af',
+        'monthly_yoy': 'e576b095205e414c8a21e112792492ba',
+        'ytd_value': 'd09f3a9f472a4c87acd4d67866b6cab7',
+        'ytd_yoy': 'f83cf22a85664de7b25ab61da994f08d',
+    }),
+    ('urban', '城镇社会消费品零售总额', 'd5c7d1062a5742c69a02c39650c7c327', {
+        'monthly_value': '9ef40e1bd70e4fd1a94005ef9a3b9e6a',
+        'monthly_yoy': '0a131939174d4d21885d3ce53cbe147f',
+        'ytd_value': '00326273e65f4c1e958c7a800fc77933',
+        'ytd_yoy': '93758cc2ed3244daae3d040f28ee7278',
+    }),
+    ('rural', '乡村社会消费品零售总额', 'd5c7d1062a5742c69a02c39650c7c327', {
+        'monthly_value': 'f32d705cc284404e82849c934011d6b0',
+        'monthly_yoy': 'dd474a9e7b7745fba458e648f1f013f6',
+        'ytd_value': 'd05a22bb2f5f433cbd09a04dbda1f12e',
+        'ytd_yoy': 'be68b49a3fe940849299549a2098e02e',
+    }),
+    ('catering', '餐饮收入', 'd9821f4ad1ec42ebbbd0554efb3e3772', {
+        'monthly_value': '446765807521445c8bbe7b7526501dc8',
+        'monthly_yoy': '476cfe584e9849c2a2bac63a2fe1dd49',
+        'ytd_value': '9172bc0eeb3246ebb803dfe803e23602',
+        'ytd_yoy': '7a6941829f2b47dfa6ba6d8190d753db',
+    }),
+    ('ls_catering', '限上单位餐饮收入', 'd9821f4ad1ec42ebbbd0554efb3e3772', {
+        'monthly_value': '24b382aea8224070a3562d8892e9c6d1',
+        'monthly_yoy': '4c08c0eb48e0472ab2044c359e0d9a96',
+        'ytd_value': 'dbc34e7102244f8eb5611306d100f28d',
+        'ytd_yoy': '1c3eead8795e45eab19d7a36e17f46e0',
+    }),
+    ('goods', '商品零售', 'd9821f4ad1ec42ebbbd0554efb3e3772', {
+        'monthly_value': '2d3e611af5214aa480b8a0a4f2c1785d',
+        'monthly_yoy': 'd76706323b3743da8b198c7f7d8c6a1c',
+        'ytd_value': '29b800dd9efc4f499be46fd3d17f4238',
+        'ytd_yoy': 'f005ff68fbd24acebe28820c86857b78',
+    }),
+    ('ls_goods', '限上单位商品零售类值', 'd9821f4ad1ec42ebbbd0554efb3e3772', {
+        'monthly_value': '55c1e5ef6a674368b5eb0d322726ff2d',
+        'monthly_yoy': '75aa5bd0cba0413b86fdcb377cbba1fc',
+        'ytd_value': '138440036ff1472eb989fb77099edd7d',
+        'ytd_yoy': 'a41610ba426c4eedbef574afe181c3d7',
+    }),
+    ('cat_grain_food', '粮油、食品类商品零售类值', 'a78d7ed67b2b40a58bb28c15c908296e', {
+        'monthly_value': 'd22f3466e81243d38f203f7da7c3a9e9',
+        'monthly_yoy': 'ba21c628b5e44fa5a9a2a7d7059d6d05',
+        'ytd_value': '336abb3ab8b64c5aa1b56221945bb463',
+        'ytd_yoy': '88deb006f65941148e4edfa5e2f5ddb2',
+    }),
+    ('cat_beverage', '饮料类商品零售类值', 'a78d7ed67b2b40a58bb28c15c908296e', {
+        'monthly_value': '35be609558574dcb82b3cda90fe3afcd',
+        'monthly_yoy': 'f58adc7997d548ba9f6dffb84afa83ae',
+        'ytd_value': '393dcc53ed9b46448d86564111947886',
+        'ytd_yoy': '2a5ec2085508433f8442441db2c6bafd',
+    }),
+    ('cat_tobacco', '烟酒类商品零售类值', 'a78d7ed67b2b40a58bb28c15c908296e', {
+        'monthly_value': '6af30ac86af04279a9f85223a15877aa',
+        'monthly_yoy': '4639a5d6b7594338938c3861fcfd2abe',
+        'ytd_value': 'cee31d46461f4f85afbbe2514a1db825',
+        'ytd_yoy': '990b475d027348fcbccdc403fce6092c',
+    }),
+    ('cat_clothing', '服装鞋帽、针、纺织品类商品零售类值', '09caab6a686d4011a34d6615f9077566', {
+        'monthly_value': '063e3ce565514fc3a740fb8abf42ec0a',
+        'monthly_yoy': '1a594bb095444dafb12f84bd0562c338',
+        'ytd_value': '73585919489e42bc99b0059c0ce63667',
+        'ytd_yoy': 'c0fe8a7d6be3448596591c748c754b5f',
+    }),
+    ('cat_cosmetics', '化妆品类商品零售类值', '2368cbdff5b848ec9802956bf471ac06', {
+        'monthly_value': '828bd42ab60843378c877c16559f1062',
+        'monthly_yoy': '4138ec8753c244ec9ac27312e28dfbe1',
+        'ytd_value': '6dbc670b040b47edb2890e3ca376f776',
+        'ytd_yoy': '3719950bfea041978dbb3b744b5dce58',
+    }),
+    ('cat_gold_jewelry', '金银珠宝类商品零售类值', 'e43cfafd0b0744d0a4da096d17786702', {
+        'monthly_value': '77c1a35cd28f4de398cdc2eb7769d902',
+        'monthly_yoy': '9685ef0e27794f2786fb20b19bcf88fb',
+        'ytd_value': 'f48694c9cabf42f48edfbf31346598af',
+        'ytd_yoy': '646decda02884f229bfb47d9bbdb53b2',
+    }),
+    ('cat_daily_use', '日用品类商品零售类值', 'b87cd34f3b594fbab5828f7038e4b6eb', {
+        'monthly_value': '50d05e85ee46433c9343a9ad8e8baf28',
+        'monthly_yoy': '54b1f685cb07413890763fe8c7aa85e5',
+        'ytd_value': 'd0687b2d1d0e4eb099bfea9edf747cf9',
+        'ytd_yoy': 'fa11a8bcee294d7fa383587a95bf62d7',
+    }),
+    ('cat_sports', '体育、娱乐用品类商品零售类值', 'b8879b68afd8499ead417f93527d20eb', {
+        'monthly_value': 'a206cec1efa8452581ad042982d10de7',
+        'monthly_yoy': 'bf8ad1adc1734a2ba0b5e1e94dd3330d',
+        'ytd_value': 'a1e9a29cf9a54b9692d6f67dc0572c57',
+        'ytd_yoy': 'fe06b5d752d4477199e09edfad5f2011',
+    }),
+    ('cat_books', '书报杂志类商品零售类值', 'bf2f054359be47d08b6526e3c4da01c9', {
+        'monthly_value': '96fcb420c37d466b9ca562355f19524f',
+        'monthly_yoy': '87e41903bc2740d3a00c9af0b4154c2d',
+        'ytd_value': 'a482f9f752414b82bf7de382daf36845',
+        'ytd_yoy': 'ba17cde4be244dcb9b8747f4b5679693',
+    }),
+    ('cat_appliance', '家用电器和音像器材类商品零售类值', '4bc877911968450aadee4fe871e5044f', {
+        'monthly_value': '033747ece86d47e683f3734da7687eba',
+        'monthly_yoy': '3e9f9ca9f4194757b229fcb6c5181283',
+        'ytd_value': 'fabe4e49b84e43b9bb0b4ad8ebf95c00',
+        'ytd_yoy': '98dcfecf002e47ea804ce6d469aa87b0',
+    }),
+    ('cat_medicine', '中西药品类商品零售类值', '65d50902a8854f6d8ca6840b7bf3ccdd', {
+        'monthly_value': '7ddd94f5a7d5491dbb4349f395128f31',
+        'monthly_yoy': 'e518e0730a6e460383f6b11927c10fbc',
+        'ytd_value': '489db3067e7c41a88eb46ccccced8b05',
+        'ytd_yoy': 'e0ab44c633c64bdcbf2d3473f98adecd',
+    }),
+    ('cat_office', '文化办公用品类商品零售类值', '6635d2abbf5d4f398150f6cc69a9c68f', {
+        'monthly_value': '8588a6bebeda42b3a215e05d73b7b2f8',
+        'monthly_yoy': '489970077f0f4926a31b33ea38c5fd01',
+        'ytd_value': '65d047b40af74d2f910c6ae780758303',
+        'ytd_yoy': 'dec4ef9586464fe8bca890b49784a1d0',
+    }),
+    ('cat_furniture', '家具类商品零售类值', '77897326002b4d06b41569410d31529a', {
+        'monthly_value': '5a9cff40657b445584888a62fd20af45',
+        'monthly_yoy': '6c867686326447c1ab5b064cb4f086ce',
+        'ytd_value': '1cfa9b6036c14dfbae118eb61f6a05f5',
+        'ytd_yoy': '22142d3017ce46a988bfb9586e95e059',
+    }),
+    ('cat_telecom', '通讯器材类商品零售类值', '036b6b83cfac4f6cb89f4223f5037569', {
+        'monthly_value': '5700c1afddff477a9ccd001d82433a8f',
+        'monthly_yoy': 'e0afb8c30c1146b293d6a12ef6a0aa81',
+        'ytd_value': '5b62e4be58044f2bad19a1b197eaac2c',
+        'ytd_yoy': '6ace326ad4404ef1a5b6adde613c6230',
+    }),
+    ('cat_petroleum', '石油及制品类商品零售类值', '5fa217ef2e1c46fcad38541d64fd05a8', {
+        'monthly_value': '39635d8dc00749f5bf002df568dcb568',
+        'monthly_yoy': '5bf62872a3db453bb2c3b71804719ce6',
+        'ytd_value': '34705ba0f2214aa1832cc00ea97bd80a',
+        'ytd_yoy': '680dce8ef6274ab888be14385e81c3c9',
+    }),
+    ('cat_building', '建筑及装潢材料类商品零售类值', 'cccea173dfe24beeb8ceb5c65702335c', {
+        'monthly_value': '21991e6835e54b6d8cad579158dd4a88',
+        'monthly_yoy': 'cdda957f3d5b49eaaeda629bd1f46d11',
+        'ytd_value': '4a6e1f0f7f5b498e98660291c8260e1c',
+        'ytd_yoy': '4448ffb4fa0f44ff881d260ab74c5ab1',
+    }),
+    ('cat_auto', '汽车类商品零售类值', '5615be125f5e46638d646e1037a07842', {
+        'monthly_value': 'c97179dabcaf4a3b8f3fb70a6646456a',
+        'monthly_yoy': '6025375b14d140ae873c317e6a12dc6c',
+        'ytd_value': '283389cbdc5a410ca2c8ed4ea5b2d939',
+        'ytd_yoy': '18cd5205818e446fae43b45e1fd37f44',
+    }),
+    ('cat_other', '其他商品零售类值', 'c2ad4f502f8c4829b6cd81d49d412c4e', {
+        'monthly_value': '210f438c31d644eb84cf2192f11730ee',
+        'monthly_yoy': '25b8977775ce4a2190e5c42168d03502',
+        'ytd_value': '95753c69620c45898935488268b1a85f',
+        'ytd_yoy': '32e67fc3013d49769f19b47afff29c4c',
+    }),
+    ('online_total_old', '网上零售额', 'fb09cbc680fe4d348c9d05f535ebf77c', {
+        'ytd_value': '069baced432b4e1787ad1da50c11e9fc',
+        'ytd_yoy': '96d4169857b8478582aa74aa2db0a675',
+    }),
+    ('online_goods_old', '实物商品网上零售额', 'fb09cbc680fe4d348c9d05f535ebf77c', {
+        'ytd_value': '05fbe85e09c842098509c6b29481ab0c',
+        'ytd_yoy': 'f12bf45bdfbb47b18147406246c787a7',
+    }),
+    ('online_total_new', '网上商品和服务零售额', 'ce144b3caaf9498aabcc713e671c1f33', {
+        'ytd_value': 'c7ac997262924badbde80e61623defde',
+        'ytd_yoy': 'cc2fa77a5bb64f8da3d63688aa0e2d1b',
+    }),
+    ('online_goods_new', '网上商品零售额', 'ce144b3caaf9498aabcc713e671c1f33', {
+        'ytd_value': '000aa31f692c4f1796dc4cbcefa6133d',
+        'ytd_yoy': 'ad9696b7ff4a49bbb9e0b40374e74ae7',
+    }),
+]
+
+# 核心序列所在叶子（总量/城乡/消费类型）全部失败 → 视为 API 不可用转新闻稿；
+# 部分核心叶失败 → 整轮 raise 拒写；非核心叶（分类/网零）失败 → warn 降级继续
+RETAIL_CORE_CODES = {'total', 'urban', 'rural', 'goods', 'catering'}
+
+# 新闻稿主表行名（_clean_cn_text + 去「、，,」+ 去「其中：」前缀后）→ indicator_code
+# None = 已知行、明确不入库（除汽车、节标题等）
+RETAIL_RELEASE_LABEL2CODE = {
+    '社会消费品零售总额': 'total',
+    '除汽车以外的消费品零售额': None,
+    '限额以上单位消费品零售额': 'ls_total',
+    '城镇': 'urban',
+    '乡村': 'rural',
+    '餐饮收入': 'catering',
+    '限额以上单位餐饮收入': 'ls_catering',
+    '商品零售': 'goods',
+    '商品零售额': 'goods',
+    '限额以上单位商品零售额': 'ls_goods',
+    '限额以上单位商品零售类值': 'ls_goods',
+    # 网零新旧口径行名不同，天然区分，无需按年份分支
+    '网上零售额': 'online_total_old',
+    '实物商品网上零售额': 'online_goods_old',
+    '网上商品和服务零售额': 'online_total_new',
+    '网上商品零售额': 'online_goods_new',
+    # 限上 16 分类（发布稿行名顿号在 clean 时去除）
+    '粮油食品类': 'cat_grain_food',
+    '饮料类': 'cat_beverage',
+    '烟酒类': 'cat_tobacco',
+    '服装鞋帽针纺织品类': 'cat_clothing',
+    '化妆品类': 'cat_cosmetics',
+    '金银珠宝类': 'cat_gold_jewelry',
+    '日用品类': 'cat_daily_use',
+    '体育娱乐用品类': 'cat_sports',
+    '书报杂志类': 'cat_books',
+    '家用电器和音像器材类': 'cat_appliance',
+    '中西药品类': 'cat_medicine',
+    '文化办公用品类': 'cat_office',
+    '家具类': 'cat_furniture',
+    '通讯器材类': 'cat_telecom',
+    '石油及制品类': 'cat_petroleum',
+    '建筑及装潢材料类': 'cat_building',
+    '汽车类': 'cat_auto',
+}
+
+RETAIL_FIELDS = ['monthly_value', 'monthly_yoy', 'ytd_value', 'ytd_yoy']
+
 
 class NBSFetcher(BaseFetcher):
     """Fetches NBS real estate data."""
@@ -223,6 +461,29 @@ class NBSFetcher(BaseFetcher):
             'columns': ['variable', 'year', 'value'],
             'strategy': 'truncate',
             'fetch_func': '_fetch_flow_of_funds',
+        },
+        {
+            'table': 'nbs_retail_sales',
+            'create_sql': """
+                CREATE TABLE IF NOT EXISTS nbs_retail_sales (
+                    record_date DATE NOT NULL,
+                    indicator_code VARCHAR(40) NOT NULL,
+                    indicator_name VARCHAR(100),
+                    monthly_value DECIMAL(18,4) DEFAULT NULL,
+                    monthly_yoy DECIMAL(10,2) DEFAULT NULL,
+                    ytd_value DECIMAL(18,4) DEFAULT NULL,
+                    ytd_yoy DECIMAL(10,2) DEFAULT NULL,
+                    PRIMARY KEY (record_date, indicator_code)
+                )
+            """,
+            'columns': ['record_date', 'indicator_code', 'indicator_name',
+                        'monthly_value', 'monthly_yoy', 'ytd_value', 'ytd_yoy'],
+            'strategy': 'upsert',
+            'update_columns': ['indicator_name', 'monthly_value', 'monthly_yoy',
+                               'ytd_value', 'ytd_yoy'],
+            # NBS 修订=换值不撤值；COALESCE 防 API 抖动的空值刷掉库内好值
+            'coalesce_update': True,
+            'fetch_func': '_fetch_retail_sales',
         },
     ]
 
@@ -810,11 +1071,14 @@ class NBSFetcher(BaseFetcher):
 
     # -- Flow of funds (NBS 新版数据发布库 API) --------------------------------
 
-    def _nbs_v2_esdata(self, cid, indicator_ids, dts):
-        """POST /stream/esData：按叶子目录 cid + 指标 UUID 列表批量取年度值。
+    def _nbs_v2_esdata(self, cid, indicator_ids, dts, root_id=NBS_V2_ANNUAL_ROOT):
+        """POST /stream/esData：按叶子目录 cid + 指标 UUID 列表批量取值。
+
+        dts 写法：年度 '1992YY-2026YY'，月度 '198401MM-202607MM'。
+        root_id 须与 cid 所在数据库一致（年度/月度根不同）。
 
         Returns:
-            list of year blocks: [{'code': '2023YY', 'values': [{'_id', 'value', ...}]}]
+            list of period blocks: [{'code': '2023YY'|'202605MM', 'values': [{'_id', 'value', ...}]}]
         """
         payload = {
             'cid': cid,
@@ -823,7 +1087,7 @@ class NBSFetcher(BaseFetcher):
             'das': [{'text': '全国', 'value': '000000000000'}],
             'showType': '1',
             'dts': [dts],
-            'rootId': NBS_V2_ANNUAL_ROOT,
+            'rootId': root_id,
         }
         r = self.session.post(f'{NBS_V2_BASE}/stream/esData', json=payload,
                               headers=NBS_V2_HEADERS, timeout=120, verify=False)
@@ -927,6 +1191,271 @@ class NBSFetcher(BaseFetcher):
                 rows.append((variable, str(year), val))
         return rows
 
+    # -- Retail sales 社会消费品零售总额 (NBS v2 月度库 + 官方新闻稿回退) -----
+
+    @staticmethod
+    def _retail_value_ok(field, val):
+        """值域护栏：亿元 (0, 1e6)，百分比 [-100, 300]。"""
+        if field.endswith('_value'):
+            return 0 < val < 1e6
+        return -100 <= val <= 300
+
+    @staticmethod
+    def _parse_retail_release_period(title):
+        """「2026年1—5月份社会消费品零售总额增长1.4%」/「2026年3月份…下降…」→ 当月 1 日。
+
+        容忍 增长/下降/持平 等任意结尾；「1—M月份」取 M；单独「1月份」不存在，
+        防御性返回 None（1 月无单独发布，避免误建 1 月行）。
+        """
+        m = re.search(r'(\d{4})年(1[—–-])?(\d{1,2})月份?'
+                      r'社会消费品零售总额', title)
+        if not m:
+            return None
+        year, combined, month = int(m.group(1)), m.group(2), int(m.group(3))
+        if not 1 <= month <= 12:
+            return None
+        if month == 1 and not combined:
+            return None
+        return date(year, month, 1)
+
+    @classmethod
+    def _retail_release_label(cls, raw):
+        """新闻稿行名归一化：去空白/序号/「其中：」/顿号逗号，供 LABEL2CODE 查表。"""
+        label = cls._clean_cn_text(raw)
+        label = re.sub(r'^[（(][一二三四五六七八九十]+[)）]', '', label)
+        label = re.sub(r'^其中[：:]', '', label)
+        label = label.lstrip('#')
+        return label.replace('、', '').replace('，', '').replace(',', '')
+
+    def _fetch_retail_release(self, title, url):
+        """解析一期社零发布稿主表 → {(record_date, code): {field: value}}。
+
+        正常月份 5 列（当月绝对量/当月同比/累计绝对量/累计同比），
+        1—2 月合并期 3 列（仅累计两列）。页面含重复表副本，取首张含「指标」的表。
+        """
+        record_date = self._parse_retail_release_period(title)
+        if not record_date:
+            return {}
+        resp = self.session.get(url, headers=NBS_RELEASE_HEADERS, timeout=60)
+        resp.raise_for_status()
+        resp.encoding = 'utf-8'
+        tables = pd.read_html(StringIO(resp.text))
+        source_table = None
+        for table in tables:
+            header = self._clean_cn_text(table.iloc[0, 0]) if table.shape[1] else ''
+            if table.shape[1] >= 3 and '指标' in header:
+                source_table = table
+                break
+        if source_table is None:
+            raise ValueError(f"Retail release table not found: {url}")
+
+        ncols = source_table.shape[1]
+        cells = {}
+        unmapped = []
+        for _, r in source_table.iloc[1:].iterrows():
+            label = self._retail_release_label(r.iloc[0])
+            if (not label or label.startswith('指标')
+                    or label.startswith('注')):
+                continue
+            if '按经营地' in label or '按消费类型' in label:
+                continue
+            if label not in RETAIL_RELEASE_LABEL2CODE:
+                unmapped.append(label)
+                continue
+            code = RETAIL_RELEASE_LABEL2CODE[label]
+            if code is None:
+                continue
+            if ncols >= 5:
+                fields = {
+                    'monthly_value': self._to_float(r.iloc[1]),
+                    'monthly_yoy': self._to_float(r.iloc[2]),
+                    'ytd_value': self._to_float(r.iloc[3]),
+                    'ytd_yoy': self._to_float(r.iloc[4]),
+                }
+            else:
+                fields = {
+                    'ytd_value': self._to_float(r.iloc[1]),
+                    'ytd_yoy': self._to_float(r.iloc[2]),
+                }
+            fields = {f: v for f, v in fields.items()
+                      if v is not None and self._retail_value_ok(f, v)}
+            if not fields:
+                continue
+            tgt = cells.setdefault((record_date, code), {})
+            for f, v in fields.items():
+                if tgt.get(f) is None:
+                    tgt[f] = v
+        if unmapped:
+            self.logger.warning(
+                f"  Retail release unmapped rows ({record_date}): {unmapped}")
+        if len(cells) < 15:
+            raise ValueError(f"Only mapped {len(cells)} retail rows from {url}")
+        self.logger.info(
+            f"  Official release {record_date}: {len(cells)} retail series")
+        return cells
+
+    def _fetch_retail_releases(self, after_date=None, max_pages=8):
+        """抓取比 after_date 新的所有社零发布稿，合并为 cell 字典。
+
+        单篇解析失败只跳过该篇（warn），不放弃其余发布稿；若所有篇目都
+        失败则返回空 dict，由调用方的 no-rows 护栏决定是否报错。
+        """
+        keyword = '社会消费品零售总额'
+        releases = []
+        for title, url in self._fetch_release_links(keyword, max_pages=max_pages):
+            record_date = self._parse_retail_release_period(title)
+            if not record_date:
+                continue
+            if after_date and record_date <= after_date:
+                continue
+            releases.append((record_date, title, url))
+        cells = {}
+        for _, title, url in sorted(releases):
+            try:
+                release_cells = self._fetch_retail_release(title, url)
+            except Exception as exc:
+                self.logger.warning(
+                    f"  Retail release parse failed, skipped ({title}): {exc}")
+                continue
+            for key, fields in release_cells.items():
+                tgt = cells.setdefault(key, {})
+                for f, v in fields.items():
+                    if tgt.get(f) is None:
+                        tgt[f] = v
+            self.rate_limit_pause(0.5)
+        return cells
+
+    def _fetch_retail_sales(self, latest_date=None):
+        """社零全指标（30 codes × 4 口径）。
+
+        主通道 v2 API：增量回看 24 个月（覆盖上年 1—2 月的基数修订），
+        表空或 NBS_RETAIL_FULL=1 时全量 1984 起。核心叶（总量/城乡/消费类型）
+        部分失败整轮 raise；全部失败转新闻稿灾备；非核心叶失败降级继续。
+        新闻稿常态补最新期（发布日 API 上库可能滞后）。
+        """
+        full = latest_date is None or os.environ.get('NBS_RETAIL_FULL') == '1'
+        today = date.today()
+        if full:
+            dts = f'198401MM-{today:%Y%m}MM'
+        else:
+            back = latest_date.year * 12 + latest_date.month - 1 - 24
+            dts = f'{date(back // 12, back % 12 + 1, 1):%Y%m}MM-{today:%Y%m}MM'
+        self.logger.info(
+            f"  Retail window {dts} ({'full' if full else 'incremental'})")
+
+        by_cid = {}
+        for code, name, cid, fields in RETAIL_INDICATORS:
+            by_cid.setdefault(cid, []).append((code, fields))
+        core_cids = {cid for code, _n, cid, _f in RETAIL_INDICATORS
+                     if code in RETAIL_CORE_CODES}
+        code_names = {code: name for code, name, _c, _f in RETAIL_INDICATORS}
+
+        cells = {}  # (record_date, code) -> {field: float}
+        core_fail = 0
+        for cid, group in by_cid.items():
+            iid_map = {}
+            for code, fields in group:
+                for field, iid in fields.items():
+                    iid_map[iid] = (code, field)
+            try:
+                blocks = self.retry_call(
+                    lambda c=cid, ids=list(iid_map): self._nbs_v2_esdata(
+                        c, ids, dts, root_id=NBS_V2_MONTHLY_ROOT),
+                    max_retries=3, backoff=3, label=f'nbs_v2_retail {cid[:8]}')
+            except Exception as exc:
+                if cid in core_cids:
+                    core_fail += 1
+                    self.logger.error(f"  Retail CORE leaf {cid[:8]} failed: {exc}")
+                else:
+                    self.logger.warning(
+                        f"  Retail leaf {cid[:8]} failed (non-core, skipped): {exc}")
+                continue
+            n_vals = 0
+            for blk in blocks:
+                code_str = str(blk.get('code', ''))[:6]
+                if not code_str.isdigit():
+                    continue
+                try:
+                    record_date = date(int(code_str[:4]), int(code_str[4:6]), 1)
+                except ValueError:
+                    continue
+                for v in blk.get('values', []):
+                    hit = iid_map.get(v.get('_id'))
+                    if hit is None:
+                        continue
+                    code, field = hit
+                    val = self._to_float(v.get('value'))
+                    if val is None:
+                        continue
+                    if not self._retail_value_ok(field, val):
+                        self.logger.warning(
+                            f"  Retail out-of-range dropped: "
+                            f"{code}.{field}@{record_date} = {val}")
+                        continue
+                    cells.setdefault((record_date, code), {})[field] = val
+                    n_vals += 1
+            self.logger.info(f"  Retail leaf {cid[:8]}: {n_vals} values")
+            self.rate_limit_pause(0.5)
+
+        if 0 < core_fail < len(core_cids):
+            raise RuntimeError(
+                f"Retail: {core_fail}/{len(core_cids)} core leaves failed; "
+                f"refusing partial write")
+        if core_fail == len(core_cids):
+            if cells:
+                raise RuntimeError(
+                    "Retail: all core leaves failed but non-core succeeded; "
+                    "inconsistent API state")
+            self.logger.warning(
+                "  Retail v2 API unavailable; relying on official releases")
+
+        api_max_date = max((d for (d, c) in cells if c == 'total'), default=None)
+        total_months = len({d for (d, c) in cells if c == 'total'})
+        if full:
+            if not cells:
+                raise RuntimeError(
+                    "Retail: initial/full fetch requires the v2 API; "
+                    "refusing to seed from releases only")
+            if total_months < 400:
+                raise RuntimeError(
+                    f"Retail full fetch only got {total_months} months for "
+                    f"'total' (expected ~500+); refusing to write")
+
+        # -- 新闻稿：常态补最新期 + API 不可用时灾备 --------------------------
+        release_after = api_max_date or (
+            latest_date - timedelta(days=1) if latest_date else None)
+        try:
+            # API 已供数时新闻稿只需补最新一期，列表翻 2 页（约 2 个月）足够；
+            # 灾备（API 无数据）时翻全 8 页拿最大深度
+            release_cells = self._fetch_retail_releases(
+                after_date=release_after, max_pages=2 if cells else 8)
+        except Exception as exc:
+            if not cells:
+                raise
+            self.logger.warning(f"  Retail release fallback failed: {exc}")
+            release_cells = {}
+        added = 0
+        for key, fields in release_cells.items():
+            tgt = cells.setdefault(key, {})
+            for field, val in fields.items():
+                if tgt.get(field) is None:
+                    tgt[field] = val
+                    added += 1
+        if added:
+            self.logger.info(f"  Retail: {added} cells added from official releases")
+        if not cells:
+            raise RuntimeError("No retail rows fetched")
+        if api_max_date is None and release_cells:
+            self._last_fetch_partial = True
+
+        rows = []
+        for (record_date, code), fields in sorted(cells.items()):
+            vals = [fields.get(f) for f in RETAIL_FIELDS]
+            if all(v is None for v in vals):
+                continue
+            rows.append((record_date, code, code_names.get(code, code), *vals))
+        return rows
+
     # -- Main entry ---------------------------------------------------------
 
     def fetch_series(self, series_config):
@@ -950,7 +1479,7 @@ class NBSFetcher(BaseFetcher):
                     period = 'LAST180'
                     self.logger.info(f"  Fetching {table} (full LAST180, table empty)...")
                 rows = fetch_func(period=period, latest_date=latest)
-            elif func_name == '_fetch_real_estate_macro':
+            elif func_name in ('_fetch_real_estate_macro', '_fetch_retail_sales'):
                 latest = self.get_latest_date(conn, table)
                 self.logger.info(f"  Fetching {table} (latest: {latest})...")
                 rows = fetch_func(latest_date=latest)
@@ -967,6 +1496,7 @@ class NBSFetcher(BaseFetcher):
                 self.upsert_rows(
                     conn, table, series_config['columns'], rows,
                     on_duplicate_update=series_config.get('update_columns'),
+                    coalesce=series_config.get('coalesce_update', False),
                 )
             self.rate_limit_pause(1.0)
         finally:

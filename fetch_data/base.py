@@ -175,12 +175,15 @@ class BaseFetcher:
             cursor.close()
 
     def upsert_rows(self, conn, table_name, columns, rows,
-                     on_duplicate_update=None):
+                     on_duplicate_update=None, coalesce=False):
         """INSERT ... ON DUPLICATE KEY UPDATE.
 
         Args:
             on_duplicate_update: list of column names to update on conflict.
                 If None, does a plain INSERT (may fail on duplicates).
+            coalesce: if True, update columns with COALESCE(VALUES(col), col)
+                so an incoming NULL never wipes an existing value (protects
+                against transient upstream blanks on re-fetched rows).
         """
         if not rows:
             return 0
@@ -188,8 +191,10 @@ class BaseFetcher:
         col_names = ', '.join(columns)
         sql = f"INSERT INTO {table_name} ({col_names}) VALUES ({placeholders})"
         if on_duplicate_update:
+            tpl = ("{col} = COALESCE(VALUES({col}), {col})" if coalesce
+                   else "{col} = VALUES({col})")
             updates = ', '.join(
-                f"{col} = VALUES({col})" for col in on_duplicate_update
+                tpl.format(col=col) for col in on_duplicate_update
             )
             sql += f" ON DUPLICATE KEY UPDATE {updates}"
         cursor = conn.cursor()
