@@ -377,6 +377,9 @@ class FREDFetcher(BaseFetcher):
     MONTH_MAP = {
         'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
         'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12,
+        'January': 1, 'February': 2, 'March': 3, 'April': 4,
+        'June': 6, 'July': 7, 'August': 8, 'September': 9,
+        'October': 10, 'November': 11, 'December': 12,
     }
 
     def _fetch_custom(self, sc):
@@ -463,12 +466,12 @@ class FREDFetcher(BaseFetcher):
 
     def _fw_parse_period_to_date(self, period_text):
         s = unescape(period_text).strip()
-        m = re.match(r"^(\d{4})\s*:\s*([A-Za-z]{3,9})$", s)
+        m = re.match(r"^(\d{4})\s*:\s*([A-Za-z]+)$", s)
         if not m:
             return None
         year = int(m.group(1))
-        mon_abbr = m.group(2)[:3].title()
-        month = self.MONTH_MAP.get(mon_abbr)
+        month_name = m.group(2).title()
+        month = self.MONTH_MAP.get(month_name) or self.MONTH_MAP.get(month_name[:3])
         if not month:
             return None
         return datetime(year, month, 1).date()
@@ -510,7 +513,7 @@ class FREDFetcher(BaseFetcher):
             data_rows = [
                 r for r in cleaned
                 if len(r) >= 8
-                and re.match(r"^\d{4}\s*:\s*[A-Za-z]{3,9}$", r[0].strip())
+                and re.match(r"^\d{4}\s*:\s*[A-Za-z]+\s*$", r[0].strip())
             ]
             if len(data_rows) >= 3:
                 return data_rows

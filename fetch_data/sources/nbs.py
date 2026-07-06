@@ -1,10 +1,11 @@
 """
-NBSFetcher -- fetcher for National Bureau of Statistics real estate data.
+NBSFetcher -- fetcher for National Bureau of Statistics data.
 
 Series:
     nbs_real_estate_climate    国房景气指数 (via AKShare)
     nbs_house_price            70城住宅价格指数 — 汇总 + 分面积 (via NBS easyquery API, dbcode=csyd)
     nbs_real_estate_macro      全国房地产月度宏观数据 — 9大类 (via NBS easyquery API, dbcode=hgyd)
+    cn_flow_of_funds           资金流量表（非金融交易）年度 1992+ (via NBS 新版数据发布库 API)
 
 Requires: pip install akshare lxml
 """
@@ -22,7 +23,10 @@ from urllib.parse import urljoin
 import akshare as ak
 import pandas as pd
 import requests
+import urllib3
 from bs4 import BeautifulSoup
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if _project_root not in sys.path:
@@ -69,6 +73,54 @@ NBS_MACRO_CATEGORIES = {
     'A060A': '商品住宅销售面积',
     'A060B': '商品住宅销售额',
 }
+
+# ---------------------------------------------------------------------------
+# NBS 新版数据发布库 API（2026 年 6 月上线，UUID 制，旧 easyquery 已 403）
+# 协议: GET  {BASE}/new/queryIndexTreeAsync?pid=<uuid>&code=3   目录树（年度=code 3）
+#       GET  {BASE}/new/queryIndicatorsByCid?cid=<uuid>&dt=&name=  叶子目录下指标元数据
+#       POST {BASE}/stream/esData  {cid, indicatorIds, das, dts, rootId, ...}  批量取值
+# 资金流量表（非金融交易）年度序列 1992 起，路径：
+#   年度数据 → 国民经济核算 → 资金流量表（非金融交易）→ 各机构部门 → 资金运用/来源
+# ---------------------------------------------------------------------------
+NBS_V2_BASE = 'https://data.stats.gov.cn/dg/website/publicrelease/web/external'
+NBS_V2_ANNUAL_ROOT = '884c062607104a91967b22742537f44f'  # 年度数据根目录 UUID
+NBS_V2_HEADERS = {
+    'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                   'AppleWebKit/537.36 (KHTML, like Gecko) '
+                   'Chrome/131.0.0.0 Safari/537.36'),
+    'Referer': 'https://data.stats.gov.cn/dg/website/page.html',
+}
+
+# (db variable, leaf catalog cid, indicator uuid)
+# 单位均为亿元。cid 为「部门|运用/来源」叶子目录，indicator 为其中具体行。
+FOF_INDICATORS = [
+    # ---- 各部门总储蓄（资金来源） ----
+    ('hh_saving',    '18bf1d34b2aa43b3be8d0814fbefca29', '369841a2a762400f9140ab5c7a8de81e'),  # 住户
+    ('gov_saving',   'fadaf98df4624baaafbb354ada72ed06', '70eab9f2938c4da0a7f42d2361917f1a'),  # 广义政府
+    ('nf_saving',    'c8cb66f46d314a039e747f426509dbd7', 'e87cf86319f046a085ba70293f218b34'),  # 非金融企业
+    ('fin_saving',   'ff99935ac60a4ebe89cda3bd53349ab9', '82eb62633c6d43b08b5d8d619963146a'),  # 金融机构
+    ('row_saving',   'baf3bf0ae7f94b7384babc624c862a95', '5506622d910549d38ebd4b5e8f6ed211'),  # 国外(=-经常账户)
+    # ---- 各部门净金融投资（资金运用，即部门净贷出） ----
+    ('hh_nfi',       'b0e282fb1220433197b41d5f95d38972', '4adb758a259541e6aaa09754acb004bd'),  # 住户
+    ('gov_nfi',      '6dc7969ac2ec4b1fb1b95027a914acb8', '02eb37ca8d1b430fa27b50d031630c9f'),  # 广义政府
+    ('nf_nfi',       'd441e3a39e044d788e3119e68bbb7742', 'd362fde42ab84bf69019d7f53e929344'),  # 非金融企业
+    ('fin_nfi',      '354f4f39bade4cfab20137339737d860', '6d02615410d947cc913b56d3dc51846e'),  # 金融机构
+    ('row_nfi',      'b6059da73d1f4f1e83ae0715621a9f3c', '55f148c5772d483fb45b350fc23a80b0'),  # 国外
+    # ---- 投资与红利 ----
+    ('gcf',          '8fbe08322ef841a484438f8c97c9fb91', 'cfd2ee3299a3444b8038600080dbb035'),  # 国内资本形成总额
+    ('nf_div_paid',  'd441e3a39e044d788e3119e68bbb7742', '0f9256de3dae418a97a9ae37e4525390'),  # 非金融企业运用红利
+    ('nf_div_recv',  'c8cb66f46d314a039e747f426509dbd7', 'a4e0ef34e4e0461caf87171fb8ce15fb'),  # 非金融企业来源红利
+    ('fin_div_paid', '354f4f39bade4cfab20137339737d860', '13a7535290f7483ab7b7eb13295c66fb'),  # 金融机构运用红利
+    ('fin_div_recv', 'ff99935ac60a4ebe89cda3bd53349ab9', '588e6206087e458f9b5ee4ba7d85f0b4'),  # 金融机构来源红利
+    # ---- 名义 GDP（国民经济核算→国内生产总值，用于 %GDP 换算） ----
+    ('ngdp',         'f7fd25aaad184414875632cf2327da60', '7dc6a2ee6c614960b7059991e0cc4d96'),
+]
+
+# 判定「最新完整年份」时必须齐全的核心变量（红利分项 2000 年前有缺失属正常）
+FOF_CORE_VARIABLES = [
+    'hh_saving', 'gov_saving', 'nf_saving', 'fin_saving', 'row_saving',
+    'hh_nfi', 'gov_nfi', 'nf_nfi', 'fin_nfi', 'row_nfi', 'gcf', 'ngdp',
+]
 
 
 class NBSFetcher(BaseFetcher):
@@ -158,6 +210,20 @@ class NBSFetcher(BaseFetcher):
             'update_columns': ['indicator_name', 'value'],
             'fetch_func': '_fetch_real_estate_macro',
         },
+        {
+            'table': 'cn_flow_of_funds',
+            'create_sql': """
+                CREATE TABLE IF NOT EXISTS cn_flow_of_funds (
+                    variable VARCHAR(32) NOT NULL,
+                    year VARCHAR(10) NOT NULL,
+                    value DECIMAL(20,4) NOT NULL,
+                    PRIMARY KEY (variable, year)
+                )
+            """,
+            'columns': ['variable', 'year', 'value'],
+            'strategy': 'truncate',
+            'fetch_func': '_fetch_flow_of_funds',
+        },
     ]
 
     @staticmethod
@@ -216,7 +282,8 @@ class NBSFetcher(BaseFetcher):
         for page_idx in range(max_pages):
             suffix = '' if page_idx == 0 else f'index_{page_idx}.html'
             page_url = urljoin(NBS_RELEASE_LIST_URL, suffix)
-            resp = self._get_release_page(page_url, timeout=30)
+            resp = self.session.get(
+                page_url, headers=NBS_RELEASE_HEADERS, timeout=30)
             resp.raise_for_status()
             resp.encoding = 'utf-8'
             soup = BeautifulSoup(resp.text, 'html.parser')
@@ -231,18 +298,6 @@ class NBSFetcher(BaseFetcher):
                 links.append((title, full_url))
             self.rate_limit_pause(0.2)
         return links
-
-    def _get_release_page(self, url, timeout=60):
-        """Fetch an official NBS release page through the configured session.
-
-        China data sources may require CN_PROXY; BaseFetcher wires that proxy
-        into self.session, so release fallback scraping must not bypass it.
-        """
-        return self.session.get(
-            url,
-            headers=NBS_RELEASE_HEADERS,
-            timeout=timeout,
-        )
 
     @staticmethod
     def _parse_house_release_period(title):
@@ -307,7 +362,7 @@ class NBSFetcher(BaseFetcher):
             'dfwds': json.dumps([{'wdcode': 'sj', 'valuecode': period}]),
             'k1': str(int(time.time() * 1000)),
         }
-        r = requests.get(NBS_API_URL, params=params, timeout=120,
+        r = requests.get(NBS_API_URL, params=params, timeout=120, verify=False,
                          headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'},
                          proxies=self._cn_proxies)
         data = self._nbs_json(r)
@@ -403,7 +458,7 @@ class NBSFetcher(BaseFetcher):
         record_date = self._parse_house_release_period(title)
         if not record_date:
             return []
-        resp = self._get_release_page(url, timeout=60)
+        resp = self.session.get(url, headers=NBS_RELEASE_HEADERS, timeout=60)
         resp.raise_for_status()
         resp.encoding = 'utf-8'
         tables = pd.read_html(StringIO(resp.text))
@@ -571,7 +626,7 @@ class NBSFetcher(BaseFetcher):
             ]),
             'k1': str(int(time.time() * 1000)),
         }
-        r = requests.get(NBS_API_URL, params=params, timeout=120,
+        r = requests.get(NBS_API_URL, params=params, timeout=120, verify=False,
                          headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'},
                          proxies=self._cn_proxies)
         data = self._nbs_json(r)
@@ -638,7 +693,7 @@ class NBSFetcher(BaseFetcher):
         record_date = self._parse_macro_release_period(title)
         if not record_date:
             return []
-        resp = self._get_release_page(url, timeout=60)
+        resp = self.session.get(url, headers=NBS_RELEASE_HEADERS, timeout=60)
         resp.raise_for_status()
         resp.encoding = 'utf-8'
         tables = pd.read_html(StringIO(resp.text))
@@ -751,6 +806,125 @@ class NBSFetcher(BaseFetcher):
             raise RuntimeError("No NBS macro rows fetched")
         if not max_date and release_rows:
             self._last_fetch_partial = True
+        return rows
+
+    # -- Flow of funds (NBS 新版数据发布库 API) --------------------------------
+
+    def _nbs_v2_esdata(self, cid, indicator_ids, dts):
+        """POST /stream/esData：按叶子目录 cid + 指标 UUID 列表批量取年度值。
+
+        Returns:
+            list of year blocks: [{'code': '2023YY', 'values': [{'_id', 'value', ...}]}]
+        """
+        payload = {
+            'cid': cid,
+            'indicatorIds': indicator_ids,
+            'daCatalogId': '',
+            'das': [{'text': '全国', 'value': '000000000000'}],
+            'showType': '1',
+            'dts': [dts],
+            'rootId': NBS_V2_ANNUAL_ROOT,
+        }
+        r = self.session.post(f'{NBS_V2_BASE}/stream/esData', json=payload,
+                              headers=NBS_V2_HEADERS, timeout=120, verify=False)
+        if r.status_code != 200:
+            snippet = r.text[:200].replace('\n', ' ')
+            raise ValueError(f"NBS v2 esData HTTP {r.status_code}: {snippet}")
+        data = r.json()
+        if data.get('state') != 20000:
+            raise ValueError(f"NBS v2 esData error: {str(data)[:200]}")
+        return data['data']
+
+    def _fof_latest_complete_year_from_db(self, conn):
+        cursor = conn.cursor()
+        try:
+            placeholders = ', '.join(['%s'] * len(FOF_CORE_VARIABLES))
+            cursor.execute(
+                f"""
+                SELECT `year` FROM cn_flow_of_funds
+                WHERE variable IN ({placeholders})
+                GROUP BY `year`
+                HAVING COUNT(DISTINCT variable) = %s
+                ORDER BY CAST(`year` AS UNSIGNED) DESC
+                LIMIT 1
+                """,
+                (*FOF_CORE_VARIABLES, len(FOF_CORE_VARIABLES)),
+            )
+            row = cursor.fetchone()
+            return int(row[0]) if row else None
+        except Exception:
+            return None
+        finally:
+            cursor.close()
+
+    def _fetch_flow_of_funds(self):
+        """Fetch 资金流量表（非金融交易）annual series 1992+ plus nominal GDP."""
+        dts = f'1992YY-{date.today().year}YY'
+
+        # 按叶子目录分组，减少请求次数
+        by_cid = {}
+        for variable, cid, iid in FOF_INDICATORS:
+            by_cid.setdefault(cid, []).append((variable, iid))
+
+        series = {}  # variable -> {year(int): float}
+        for cid, pairs in by_cid.items():
+            ids = [iid for _, iid in pairs]
+            id2var = {iid: variable for variable, iid in pairs}
+            blocks = self.retry_call(
+                lambda c=cid, i=ids: self._nbs_v2_esdata(c, i, dts),
+                max_retries=3,
+                backoff=3,
+                label=f'nbs_v2_esdata {cid[:8]}',
+            )
+            for blk in blocks:
+                year_str = str(blk.get('code', '')).replace('YY', '')
+                if not year_str.isdigit():
+                    continue
+                for v in blk.get('values', []):
+                    variable = id2var.get(v.get('_id'))
+                    if variable is None:
+                        continue
+                    val = self._to_float(v.get('value'))
+                    if val is None:
+                        continue
+                    series.setdefault(variable, {})[int(year_str)] = val
+            self.rate_limit_pause(0.4)
+
+        missing = [v for v, _, _ in FOF_INDICATORS if not series.get(v)]
+        if missing:
+            raise RuntimeError(
+                f"NBS v2 FoF response missing variables: {', '.join(missing)}")
+
+        # 最新完整年份：所有核心变量齐全的最大年份；防止半截数据覆盖完整数据
+        complete_years = None
+        for variable in FOF_CORE_VARIABLES:
+            years = set(series[variable])
+            complete_years = years if complete_years is None else complete_years & years
+        if not complete_years:
+            raise RuntimeError("NBS v2 FoF: no complete year across core variables")
+        latest = max(complete_years)
+        if len(complete_years) < 25:
+            raise RuntimeError(
+                f"NBS v2 FoF: only {len(complete_years)} complete years "
+                f"(expected ~30+); refusing to overwrite")
+
+        conn = self.get_connection()
+        try:
+            existing_latest = self._fof_latest_complete_year_from_db(conn)
+        finally:
+            conn.close()
+        if existing_latest and latest < existing_latest:
+            raise RuntimeError(
+                f"NBS v2 FoF latest complete year would regress from "
+                f"{existing_latest} to {latest}; refusing to overwrite")
+
+        self.logger.info(
+            f"  FoF: {len(complete_years)} complete years, latest {latest}")
+
+        rows = []
+        for variable, years in series.items():
+            for year, val in years.items():
+                rows.append((variable, str(year), val))
         return rows
 
     # -- Main entry ---------------------------------------------------------

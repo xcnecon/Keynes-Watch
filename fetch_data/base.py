@@ -36,6 +36,16 @@ def _quote_identifier(identifier):
     return f"`{str(identifier).replace('`', '``')}`"
 
 
+def _transaction_connection(conn):
+    """Return the object that owns transaction state for a DB connection.
+
+    PooledMySQLConnection proxies attribute *reads* to the underlying
+    connection, but assigning ``conn.autocommit = ...`` on the pooled wrapper
+    creates an instance attribute instead of toggling the real connection.
+    """
+    return getattr(conn, '_cnx', conn)
+
+
 def _db_config_from_env():
     """Build a MySQL config from environment variables."""
     required = {
@@ -229,12 +239,13 @@ class BaseFetcher:
         temp_table_sql = _quote_identifier(temp_table_name)
         col_names = ', '.join(_quote_identifier(col) for col in columns)
         placeholders = ', '.join(['%s'] * len(columns))
-        old_autocommit = getattr(conn, 'autocommit', False)
+        tx_conn = _transaction_connection(conn)
+        old_autocommit = getattr(tx_conn, 'autocommit', False)
 
         cursor = conn.cursor()
         try:
             if old_autocommit:
-                conn.autocommit = False
+                tx_conn.autocommit = False
 
             cursor.execute(
                 f"CREATE TEMPORARY TABLE {temp_table_sql} LIKE {table_sql}"
@@ -268,7 +279,7 @@ class BaseFetcher:
                     f"  Could not drop temporary table for {table_name}: {exc}"
                 )
             if old_autocommit:
-                conn.autocommit = True
+                tx_conn.autocommit = True
             cursor.close()
 
     # -- Rate limiting helper -----------------------------------------------
