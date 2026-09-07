@@ -155,6 +155,52 @@ Run a subset with the script:
 FETCH_SOURCES="fred bea fiscal" bash scripts/update_all.sh
 ```
 
+## Data integrity and tests
+
+The [2026-09-07 page audit](docs/data-audit-2026-09-07.md) records the checks
+of all 32 data pages, confirmed errors, fixes, and limitations arising from
+the web application and production database being outside this repository.
+
+Run the offline regression suite:
+
+```bash
+python -m pip install -r requirements-test.txt
+python -m pytest -q
+```
+
+Normal source updates also repair the affected stored history:
+
+- MTS reads all available Table 1 reports and upserts each month's latest
+  revision, resolving the fiscal-year parent before converting USD to millions.
+  Existing observations before the API coverage are preserved.
+- Treasury maturity updates recalculate summaries exclusively from securities
+  with a contractual maturity date, even when no new month is available.
+- Repo updates start from the earlier of the Repo and Reverse Repo watermarks,
+  with a seven-day overlap; only completed auction results are summed.
+- PBOC OMO revisits the recent month and any earlier stored zero-rate error;
+  zero-volume notices without a rate are stored with a NULL rate. The website
+  must preserve that missing value rather than render it as a 0% policy rate.
+- NBS retail revisits recent official releases to fill missed periods, including
+  first-half reports named “上半年”.
+- GDP, CPI and reserve balances refresh existing observations to accept revisions.
+
+After deploying this branch's fetchers in the production update environment,
+the targeted updates are:
+
+```bash
+python -m fetch_data.run --source fiscal --series mts
+python -m fetch_data.run --source fiscal --series treasury_average_maturity
+python -m fetch_data.run --source nyfed --series repo
+python -m fetch_data.run --source pboc --series pboc_omo
+python -m fetch_data.run --source nbs --series nbs_retail_sales
+python -m fetch_data.run --source fred
+```
+
+The tests use public source fixtures and isolated database substitutes, without
+API keys or production access. GitHub Actions runs the same suite. Pushing or
+merging this repository alone does not establish that the live database or web
+application has been refreshed.
+
 ## Privacy Notes
 
 The public repository intentionally excludes:

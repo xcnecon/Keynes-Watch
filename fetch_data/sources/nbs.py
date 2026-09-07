@@ -1207,6 +1207,11 @@ class NBSFetcher(BaseFetcher):
         容忍 增长/下降/持平 等任意结尾；「1—M月份」取 M；单独「1月份」不存在，
         防御性返回 None（1 月无单独发布，避免误建 1 月行）。
         """
+        title = re.sub(r'\s+', '', title)
+        named = re.search(r'(\d{4})年(上半年|前三季度|一季度|全年)社会消费品零售总额', title)
+        if named:
+            month = {'上半年': 6, '前三季度': 9, '一季度': 3, '全年': 12}[named[2]]
+            return date(int(named[1]), month, 1)
         m = re.search(r'(\d{4})年(1[—–-])?(\d{1,2})月份?'
                       r'社会消费品零售总额', title)
         if not m:
@@ -1422,13 +1427,14 @@ class NBSFetcher(BaseFetcher):
                     f"'total' (expected ~500+); refusing to write")
 
         # -- 新闻稿：常态补最新期 + API 不可用时灾备 --------------------------
-        release_after = api_max_date or (
-            latest_date - timedelta(days=1) if latest_date else None)
+        # Revisit recent releases even when a later month exists in the API.
+        # Otherwise a missed June ('上半年') can never be repaired after July.
+        anchor = api_max_date or latest_date
+        release_after = anchor - timedelta(days=370) if anchor else None
         try:
-            # API 已供数时新闻稿只需补最新一期，列表翻 2 页（约 2 个月）足够；
-            # 灾备（API 无数据）时翻全 8 页拿最大深度
+            # 回看发布列表，补齐曾被标题解析漏掉的月份（例如「上半年」）。
             release_cells = self._fetch_retail_releases(
-                after_date=release_after, max_pages=2 if cells else 8)
+                after_date=release_after, max_pages=8)
         except Exception as exc:
             if not cells:
                 raise

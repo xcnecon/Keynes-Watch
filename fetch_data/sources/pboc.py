@@ -17,7 +17,7 @@ import re
 import sys
 import math
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import akshare as ak
 import pandas as pd
@@ -752,6 +752,68 @@ class PBOCFetcher(BaseFetcher):
             rows.append((d, t, r))
         return rows
 
+    @staticmethod
+    def _parse_omo_html(soup):
+        """Read named columns; zero allotment is not a zero policy rate.
+
+        No-operation notices have only tenor/bid/allotment columns. Preserve
+        their zero volume with a NULL rate, rather than interpreting the last
+        volume column as an interest rate. Whitespace can split Chinese labels
+        and even the decimal rate across HTML spans.
+        """
+        content = soup.find('div', id='ewebeditor_content') or soup.find('div', id='zoom')
+        if not content:
+            return []
+        text = re.sub(r'\s+', '', content.get_text())
+        if '逆回购' not in text:
+            return []
+        match = re.search(r'(\d{4})年(\d{1,2})月(\d{1,2})日', text)
+        if not match:
+            return []
+        trade_date = datetime(*(int(v) for v in match.groups())).date().isoformat()
+        results = {}
+        for table in content.find_all('table'):
+            columns = None
+            for tr in table.find_all('tr'):
+                cells = [re.sub(r'\s+', '', c.get_text())
+                         for c in tr.find_all(['td', 'th'])]
+                if any('期限' in c for c in cells):
+                    columns = {}
+                    for i, cell in enumerate(cells):
+                        if '期限' in cell:
+                            columns['tenor'] = i
+                        elif '利率' in cell:
+                            columns['rate'] = i
+                        elif '中标量' in cell or '操作量' in cell:
+                            columns['volume'] = i
+                    continue
+                if not columns or not {'tenor', 'volume'} <= columns.keys():
+                    continue
+                if max(columns.values()) >= len(cells):
+                    continue
+                tenor_match = re.fullmatch(r'(\d+)天', cells[columns['tenor']])
+                if not tenor_match:
+                    continue
+                tenor = int(tenor_match[1])
+
+                def number(cell):
+                    match = re.fullmatch(r'([\d,.]+)(?:%|％|亿元)?', cell)
+                    return float(match[1].replace(',', '')) if match else None
+
+                volume = number(cells[columns['volume']])
+                rate = number(cells[columns['rate']]) if 'rate' in columns else None
+                if volume is None or not math.isfinite(volume):
+                    raise ValueError(f'OMO {trade_date}: invalid allotment')
+                if rate is not None and (not math.isfinite(rate) or not 0 < rate < 20):
+                    raise ValueError(f'OMO {trade_date}: invalid stated interest rate')
+                if rate is None and volume != 0:
+                    raise ValueError(f'OMO {trade_date}: nonzero operation missing rate')
+                row = (trade_date, tenor, rate, volume)
+                if tenor in results and results[tenor] != row:
+                    raise ValueError(f'OMO {trade_date}: conflicting {tenor}-day rows')
+                results[tenor] = row
+        return list(results.values())
+
     def _fetch_omo(self, latest_date=None, _conn=None):
         """Fetch PBOC OMO (reverse repo) data from two sources:
         1. PBOC official website (pbc.gov.cn) — always up-to-date
@@ -768,66 +830,38 @@ class PBOCFetcher(BaseFetcher):
 
         columns = ['trade_date', 'tenor', 'rate', 'volume']
         total_saved = 0
-        latest_str = str(latest_date) if latest_date else None
-
-        def _parse_omo_html(soup):
-            """Parse an OMO announcement HTML, return list of (date, tenor, rate, vol)."""
-            content = (soup.find('div', id='ewebeditor_content')
-                       or soup.find('div', id='zoom'))
-            if not content:
-                return []
-            text = content.get_text()
-            if '逆回购' not in text:
-                return []
-            date_m = re.search(r'(\d{4})年(\d{1,2})月(\d{1,2})日', text)
-            if not date_m:
-                return []
-            trade_date = (f'{date_m.group(1)}-'
-                          f'{date_m.group(2).zfill(2)}-'
-                          f'{date_m.group(3).zfill(2)}')
-            table = content.find('table')
-            if not table:
-                return []
-            trs = table.find_all('tr')
-            if len(trs) < 2:
-                return []
-            header_cells = [c.get_text(strip=True) for c in trs[0].find_all(['td', 'th'])]
-            new_fmt = '操作利率' in header_cells
-            results = []
-            for tr in trs[1:]:
-                cells = [c.get_text(strip=True) for c in tr.find_all('td')]
-                if len(cells) < 3:
-                    continue
-                tenor_m = re.search(r'(\d+)', cells[0])
-                if not tenor_m:
-                    continue
-                tenor = int(tenor_m.group(1))
-                if new_fmt:
-                    rate_m = re.search(r'(\d+\.?\d*)', cells[1])
-                    vol_m = re.search(r'(\d+\.?\d*)',
-                                      cells[3] if len(cells) > 3 else cells[2])
-                else:
-                    vol_m = re.search(r'(\d+\.?\d*)', cells[1])
-                    rate_m = re.search(r'(\d+\.?\d*)', cells[2])
-                rate = float(rate_m.group(1)) if rate_m else None
-                volume = float(vol_m.group(1)) if vol_m else None
-                # Sanity: swap if rate/volume look reversed (old format variants)
-                if rate is not None and volume is not None and rate > 10 and volume < 10:
-                    rate, volume = volume, rate
-                if rate is not None:
-                    results.append((trade_date, tenor, rate, volume))
-            return results
+        collected = []
+        # Re-read a month and extend to the earliest legacy 0% row, so the
+        # standard updater repairs bad history instead of just appending.
+        since = pd.to_datetime(latest_date).date() - timedelta(days=31) if latest_date else None
+        if _conn:
+            cursor = _conn.cursor()
+            try:
+                cursor.execute('SELECT MIN(trade_date) FROM pboc_omo WHERE rate = 0')
+                bad = cursor.fetchone()
+                if bad and bad[0]:
+                    before_bad = pd.to_datetime(bad[0]).date() - timedelta(days=1)
+                    since = min(since, before_bad) if since else None
+            finally:
+                cursor.close()
+        latest_str = since.isoformat() if since else None
 
         def _save_batch(rows, source_label, page_num):
             nonlocal total_saved
             if rows and _conn:
-                self.insert_ignore_rows(_conn, 'pboc_omo', columns, rows)
+                if source_label == 'PBOC':
+                    self.upsert_rows(_conn, 'pboc_omo', columns, rows,
+                                     on_duplicate_update=['rate', 'volume'])
+                else:
+                    # Historical mirror must not overwrite the official source.
+                    self.insert_ignore_rows(_conn, 'pboc_omo', columns, rows)
                 total_saved += len(rows)
                 date_range = f'{rows[-1][0]}~{rows[0][0]}'
                 self.logger.info(f'  [{source_label}] page {page_num}: '
                                  f'+{len(rows)} rows ({date_range}), total={total_saved}')
             elif rows:
                 total_saved += len(rows)
+                collected.extend(rows)
 
         # ── Source 1: PBOC official website (pbc.gov.cn) ──────────────
         self.logger.info('  Fetching from PBOC official website...')
@@ -867,7 +901,7 @@ class PBOCFetcher(BaseFetcher):
                 ann_url = f'{pboc_base}{href}'
                 try:
                     ann_html = self._get_pboc_html(ann_url)
-                    parsed = _parse_omo_html(BeautifulSoup(ann_html, 'html.parser'))
+                    parsed = self._parse_omo_html(BeautifulSoup(ann_html, 'html.parser'))
                     page_rows.extend(parsed)
                     self.rate_limit_pause(0.2)
                 except Exception as e:
@@ -937,7 +971,7 @@ class PBOCFetcher(BaseFetcher):
                         resp2 = self.session.get(
                             url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=20)
                         resp2.encoding = 'utf-8'
-                        parsed = _parse_omo_html(BeautifulSoup(resp2.text, 'html.parser'))
+                        parsed = self._parse_omo_html(BeautifulSoup(resp2.text, 'html.parser'))
                         page_rows.extend(parsed)
                         self.rate_limit_pause(0.2)
                     except Exception as e:
@@ -948,7 +982,7 @@ class PBOCFetcher(BaseFetcher):
                 self.rate_limit_pause(0.3)
 
         self.logger.info(f'  OMO fetch done: {total_saved} total entries')
-        return []
+        return collected
 
     def _fetch_shibor(self):
         """Fetch SHIBOR rates via ak.macro_china_shibor_all()."""
