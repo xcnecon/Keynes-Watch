@@ -14,7 +14,10 @@ Replaces the following standalone scripts:
 import os
 import sys
 import argparse
-from datetime import datetime
+import calendar
+import re
+from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 
 import pandas as pd
 
@@ -194,11 +197,81 @@ SERIES_MTS = {
         )
     """,
     'endpoint': '/v1/accounting/mts/mts_table_1',
-    'fields': 'record_date,classification_desc,record_calendar_year,current_month_gross_rcpt_amt,current_month_gross_outly_amt,current_month_dfct_sur_amt',
-    'strategy': 'incremental',
+    # Keep row identity: omitting it makes Fiscal Data SUM identically named
+    # months in the current and prior fiscal-year sections of Table 1.
+    'fields': 'record_date,parent_id,classification_id,classification_desc,record_type_cd,record_fiscal_year,current_month_gross_rcpt_amt,current_month_gross_outly_amt,current_month_dfct_sur_amt',
+    'strategy': 'full',
     'date_column': 'record_date',
     'handler': '_handle_mts',
 }
+
+
+def parse_mts_rows(records):
+    """Return monthly USD millions, using each month's latest report vintage.
+
+    record_date dates the *report*, not every observation printed in it.
+    Resolve the fiscal-year heading through parent_id before dating a month;
+    October--December belong to the previous calendar year. Deficits are
+    positive, surpluses negative. Never replace missing receipts/outlays by 0.
+    """
+    headings = {}
+    reports = set()
+    for record in records:
+        report_date = date.fromisoformat(record['record_date'])
+        reports.add(report_date)
+        match = re.fullmatch(r'FY\s+(\d{4})', record['classification_desc'].strip())
+        if match:
+            headings[(report_date, str(record['classification_id']))] = int(match[1])
+
+    month_numbers = {name: i for i, name in enumerate(calendar.month_name) if name}
+    observations = {}
+    current_months = set()
+    for record in records:
+        month = month_numbers.get(record['classification_desc'].strip())
+        if month is None:
+            continue  # headings and YTD totals are not monthly observations
+        report_date = date.fromisoformat(record['record_date'])
+        fiscal_year = headings.get((report_date, str(record.get('parent_id'))))
+        if fiscal_year is None:
+            raise ValueError(f'MTS {report_date}: month has no fiscal-year heading')
+        year = fiscal_year - (month >= 10)
+        period = date(year, month, calendar.monthrange(year, month)[1])
+        if period > report_date:
+            continue  # future-month placeholders in historical reports
+
+        values = []
+        for field in ('current_month_gross_rcpt_amt', 'current_month_gross_outly_amt'):
+            try:
+                value = Decimal(str(record.get(field)))
+            except InvalidOperation as exc:
+                raise ValueError(f'MTS {period}: missing/invalid {field}') from exc
+            if not value.is_finite():
+                raise ValueError(f'MTS {period}: nonfinite {field}')
+            values.append(value)
+        receipts, outlays = values
+        deficit = outlays - receipts
+        raw_deficit = clean_value(record.get('current_month_dfct_sur_amt'))
+        if raw_deficit is not None:
+            try:
+                published = Decimal(str(raw_deficit))
+            except InvalidOperation as exc:
+                raise ValueError(f'MTS {period}: invalid deficit') from exc
+            if not published.is_finite() or abs(published - deficit) > Decimal('0.01'):
+                raise ValueError(f'MTS {period}: receipts/outlays/deficit do not reconcile')
+        row = (period, *(v / Decimal(1_000_000) for v in (receipts, outlays, deficit)))
+        key = (period, report_date)
+        if key in observations and observations[key] != row:
+            raise ValueError(f'MTS {period}: conflicting rows in report {report_date}')
+        observations[key] = row
+        if period == report_date:
+            current_months.add(report_date)
+
+    if reports - current_months:
+        raise ValueError(f'MTS reports missing their current month: {sorted(reports - current_months)}')
+    latest = {}
+    for (period, vintage), row in sorted(observations.items()):
+        latest[period] = row
+    return [latest[period] for period in sorted(latest)]
 
 SERIES_WITHHELD_TAX = {
     'table': 'withheld_tax',
@@ -373,8 +446,6 @@ class FiscalDataFetcher(BaseFetcher):
 
             data = self._fetch_fiscal_data(config['endpoint'], config['fields'],
                                            since=latest_date)
-            if not data:
-                return
 
             cursor = conn.cursor()
             try:
@@ -468,10 +539,20 @@ class FiscalDataFetcher(BaseFetcher):
 
                 # --- Calculate weights ---
                 self.logger.info("  Calculating weights...")
+                cursor.execute("""
+                    UPDATE treasury_average_maturity
+                    SET weight = NULL, weight_by_type = NULL
+                    WHERE maturity_date IS NULL
+                """)
                 cursor.execute("SELECT DISTINCT record_date FROM treasury_average_maturity")
                 record_dates = cursor.fetchall()
+                new_dates = {pd.to_datetime(r['record_date']).date() for r in data}
 
                 for (rd_val,) in record_dates:
+                    # Old detail weights are unchanged; only their summaries
+                    # need the repair below. Avoid rewriting every bond daily.
+                    if pd.to_datetime(rd_val).date() not in new_dates:
+                        continue
                     cursor.execute("""
                         SELECT amount FROM treasury_average_maturity
                         WHERE record_date = %s AND security_class1_desc = 'Total Marketable'
@@ -496,7 +577,7 @@ class FiscalDataFetcher(BaseFetcher):
                     # Individual records
                     cursor.execute("""
                         SELECT id, amount, security_class1_desc FROM treasury_average_maturity
-                        WHERE record_date = %s AND security_class1_desc NOT LIKE 'Total%%'
+                        WHERE record_date = %s AND maturity_date > record_date
                     """, (rd_val,))
                     ind_rows = cursor.fetchall()
 
@@ -512,7 +593,7 @@ class FiscalDataFetcher(BaseFetcher):
                         weight = amount / total_marketable if total_marketable else None
                         weight_by_type = (
                             amount / totals_by_type.get(total_type_key, 0)
-                            if total_type_key and total_type_key in totals_by_type else None
+                            if total_type_key and totals_by_type.get(total_type_key) else None
                         )
                         cursor.execute("""
                             UPDATE treasury_average_maturity
@@ -523,12 +604,15 @@ class FiscalDataFetcher(BaseFetcher):
                 conn.commit()
                 self.logger.info("  Weights calculated")
 
+                # Summary rows also acquire a calculated maturity. Exclude them
+                # by contractual maturity_date, including on subsequent runs.
                 # --- Calculate weighted-average maturities ---
                 self.logger.info("  Calculating weighted-average maturities...")
                 for (rd_val,) in record_dates:
                     cursor.execute("""
                         SELECT amount, maturity FROM treasury_average_maturity
-                        WHERE record_date = %s AND maturity IS NOT NULL
+                        WHERE record_date = %s AND maturity_date > record_date
+                          AND maturity IS NOT NULL
                     """, (rd_val,))
                     mat_rows = cursor.fetchall()
                     total_amount = sum(r[0] for r in mat_rows)
@@ -551,7 +635,8 @@ class FiscalDataFetcher(BaseFetcher):
                     for sec_type, total_desc in type_map_mat.items():
                         cursor.execute("""
                             SELECT amount, maturity FROM treasury_average_maturity
-                            WHERE record_date = %s AND maturity IS NOT NULL
+                            WHERE record_date = %s AND maturity_date > record_date
+                              AND maturity IS NOT NULL
                               AND security_class1_desc = %s
                         """, (rd_val, sec_type))
                         type_rows = cursor.fetchall()
@@ -602,53 +687,15 @@ class FiscalDataFetcher(BaseFetcher):
             if latest_date is None:
                 latest_date = self._seed_mts_from_csv(conn, config['table'])
 
-            data = self._fetch_fiscal_data(config['endpoint'], config['fields'],
-                                           since=latest_date)
+            # Re-read the small monthly history so existing contaminated rows
+            # and subsequent Treasury revisions are repaired by the normal run.
+            data = self._fetch_fiscal_data(config['endpoint'], config['fields'])
             if not data:
-                return
+                raise ValueError('MTS returned no history; keeping existing data')
+            rows = parse_mts_rows(data)
+            if latest_date and (not rows or rows[-1][0] < latest_date):
+                raise ValueError('MTS history regressed; keeping existing data')
 
-            df = pd.DataFrame(data)
-            if df.empty:
-                return
-
-            df['record_date'] = pd.to_datetime(df['record_date'], errors='coerce')
-            df = df.dropna(subset=['record_date'])
-            df['record_year'] = df['record_date'].dt.year
-            df['month_name'] = df['record_date'].dt.strftime('%B')
-
-            df['record_calendar_year'] = pd.to_numeric(
-                df.get('record_calendar_year'), errors='coerce'
-            )
-            df = df[
-                (df['classification_desc'] == df['month_name'])
-                & (df['record_calendar_year'] == df['record_year'])
-            ]
-
-            df['receipts'] = pd.to_numeric(
-                df.get('current_month_gross_rcpt_amt'), errors='coerce'
-            ).fillna(0.0)
-            df['outlays'] = pd.to_numeric(
-                df.get('current_month_gross_outly_amt'), errors='coerce'
-            ).fillna(0.0)
-            df['deficit'] = pd.to_numeric(
-                df.get('current_month_dfct_sur_amt'), errors='coerce'
-            )
-            df['deficit'] = df['deficit'].where(
-                df['deficit'].notna(), df['outlays'] - df['receipts']
-            )
-
-            # Scale to millions
-            scale = 1_000_000.0
-            df['receipts'] = df['receipts'] / scale
-            df['outlays'] = df['outlays'] / scale
-            df['deficit'] = df['deficit'] / scale
-
-            df['record_date'] = df['record_date'].dt.date
-            final_df = df[['record_date', 'receipts', 'outlays', 'deficit']].drop_duplicates(
-                subset=['record_date'], keep='last'
-            )
-
-            rows = list(final_df.itertuples(index=False, name=None))
             columns = ['record_date', 'receipts', 'outlays', 'deficit']
             self.upsert_rows(conn, config['table'], columns, rows,
                              on_duplicate_update=['receipts', 'outlays', 'deficit'])
