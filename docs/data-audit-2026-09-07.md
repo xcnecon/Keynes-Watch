@@ -121,7 +121,7 @@ Total Marketable 行也获得 `maturity`，后续更新把它们重新计权；�
 | `/us/indeed` | 美国工资同比，未见明显异常。 |
 | `/us/indeed_job_post` | 招聘指数，未见明显异常。 |
 | `/us/kalecki_equation` | 最新至 2026Q2，分项正负合计约为零；未见明显数值异常。 |
-| `/us/three_sector_balance` | 最新仍为 2026Q1，附加 discrepancy 时加总不为零；网页/查询层待查。 |
+| `/us/three_sector_balance` | 私人净贷出官方最新为 2026Q1，因此日期本身正常；GDP–GDI discrepancy 被额外堆叠的问题属于网页层。 |
 | `/cn/lpr` | 未见明显异常。 |
 | `/cn/money_supply` | 官方同比及 M1-M2 差值未见明显异常；不应用口径变化后的绝对量自算跨年增速。 |
 | `/cn/social_financing` | 默认累计增量口径未见明显异常。 |
@@ -129,7 +129,7 @@ Total Marketable 行也获得 `maturity`，后续更新把它们重新计权；�
 | `/cn/rrr` | 图为政策调整历史，最后调整日期不等于每日数据停更；未见明确错值。 |
 | `/cn/shibor` | 确认零操作量误读为零利率；已修复。 |
 | `/cn/balance_sheet` | 默认资产分项单位为亿元，未见明显异常。 |
-| `/cn/real_estate_macro` | 图的月度值来自累计差分，未见明显异常。 |
+| `/cn/real_estate_macro` | 后续网页代码核验发现先截日期再差分、把1—2月累计当作2月单月值的问题；需在网页层修复。 |
 | `/cn/house_price` | 指数基准为 100，不是同比百分比；未见明显异常。 |
 | `/cn/real_estate_climate` | 历史序列止于 2025-12，主页明确标记 historical；不是最新月度覆盖。 |
 | `/cn/land_revenue` | 累计财政收入，未见明显数值异常；2023 覆盖不完整，不能当完整月度历史。 |
@@ -139,14 +139,15 @@ Total Marketable 行也获得 `maturity`，后续更新把它们重新计权；�
 
 ## 仓库缺少网页代码，尚未修复的展示问题
 
-1. **美国三部门余额**：2026Q1 输出的 private、foreign、public 三条已经合计
-   为 0，却再绘制 -0.914773% GDP 的 discrepancy；若四条用于展示闭合身份式，
-   就不能这样处理。手动把结束日改为 2026-06-30 仍只返回 Q1，尽管同源
-   Kalecki 页面已经有 Q2。需检查其路由计算、筛选和数据库读取，不能通过
-   任意改写 BEA 源数据来掩盖。
-2. **美国短端利率**：默认 EFFR trace 有 1,097 个点但只有 753 个不同日期；
-   重复日期值相同。仓库建表声明 `(record_date,type)` 主键；重复可能来自
-   生产旧表结构或网页 join/拼接，需要实际 schema / 查询才能确定。
+1. **美国三部门余额**：2026Q1 的三条部门序列已合计为 0，却额外堆叠
+   GDP–GDI discrepancy。后续网页核查已定位到直接将该列加入部门柱形。
+   **更正日期判断**：官方 [私人净贷出 W994RC1Q027SBEA](https://fred.stlouisfed.org/series/W994RC1Q027SBEA)
+   最新也是 2026Q1；[NIPA 5.1 发布表](https://fred.stlouisfed.org/release/tables?eid=7581&rid=53)
+   的 Q2 私人净贷出为空，因此不能因 Kalecki 已有 Q2 就认定三部门停更。
+2. **美国短端利率**：默认 EFFR trace 有 1,097 个点但只有 753 个不同日期，
+   重复日期值相同。后续网页核查确认读取整表，没有 join；当前建表声明
+   `(record_date,type)` 主键。未读取生产 schema，不能断言旧表缺少哪项约束。
+   展示端需要消除相同重复点，对冲突值留空；本 ETL 仓库不包含该路由。
 3. **生产是否恢复**：此 PR 没有连接生产数据库、执行更新脚本或清除网页缓存。
    修复需在生产 updater 使用新代码后运行相应 source；网页层残留需另行修复。
 
