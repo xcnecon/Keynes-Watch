@@ -108,16 +108,24 @@ class NYFedFetcher(BaseFetcher):
         conn = self.get_connection()
         try:
             self.ensure_table(conn, config['create_sql'])
-            latest_date = self.get_latest_date(conn, config['table'],
-                                               config.get('date_column', 'record_date'))
-
             url = config['url']
-            latest_dt = pd.to_datetime(latest_date).date() if latest_date else None
-            start_date = (
-                (latest_dt + timedelta(days=1)).isoformat()
-                if latest_dt else config['default_start_date']
-            )
-            resp = self.session.get(f"{url}?startDate={start_date}")
+            # Each operation type has its own publication history. A later
+            # Repo row must not prevent filling missing Reverse Repo dates.
+            cursor = conn.cursor()
+            try:
+                cursor.execute("""
+                    SELECT type, MAX(record_date) FROM repo
+                    WHERE type IN ('Repo', 'Reverse Repo') GROUP BY type
+                """)
+                latest_by_type = dict(cursor.fetchall())
+            finally:
+                cursor.close()
+            if all(latest_by_type.get(t) for t in ('Repo', 'Reverse Repo')):
+                oldest = min(pd.to_datetime(v).date() for v in latest_by_type.values())
+                start_date = (oldest - timedelta(days=7)).isoformat()
+            else:
+                start_date = config['default_start_date']
+            resp = self.session.get(f"{url}?startDate={start_date}", timeout=60)
             resp.raise_for_status()
             all_data = resp.json().get('repo', {}).get('operations', [])
 
@@ -128,18 +136,26 @@ class NYFedFetcher(BaseFetcher):
             self.logger.info("  Fetched %d repo operations", len(all_data))
 
             repo_totals = {}
+            seen_operations = set()
             for record in all_data:
+                # Announced (unfinished) auctions do not yet have a result.
+                if record.get('auctionStatus') != 'Results':
+                    continue
+                operation_id = record.get('operationId')
+                if operation_id and operation_id in seen_operations:
+                    continue
                 record_date = clean_value(record.get("operationDate"), data_type='date')
                 op_type = clean_value(record.get("operationType"), data_type='text')
-                if not record_date or not op_type:
+                if not record_date or op_type not in ('Repo', 'Reverse Repo'):
                     continue
-
-                if latest_dt and pd.to_datetime(record_date).date() <= latest_dt:
+                if record_date < start_date:
                     continue
 
                 raw_amount = clean_value(record.get("totalAmtAccepted"), data_type='numeric')
                 if raw_amount is None:
-                    raw_amount = 0.0
+                    raise ValueError(f'Repo result {operation_id} is missing accepted amount')
+                if operation_id:
+                    seen_operations.add(operation_id)
                 amount = raw_amount / 1_000_000_000
                 key = (record_date, op_type)
                 repo_totals[key] = repo_totals.get(key, 0.0) + amount

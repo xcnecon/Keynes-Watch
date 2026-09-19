@@ -11,6 +11,7 @@ Usage:
             ...
 """
 
+import json
 import logging
 import os
 import threading
@@ -29,6 +30,14 @@ load_dotenv()
 
 _db_pool = None
 _db_pool_lock = threading.Lock()
+
+
+class AbortFetch(Exception):
+    """Raised inside a retried call to abort immediately.
+
+    retry_call() re-raises this without further attempts or backoff sleeps —
+    for conditions that won't heal within this run (e.g. WAF throttle ban).
+    """
 
 
 def _quote_identifier(identifier):
@@ -96,6 +105,44 @@ def setup_logging(level=logging.INFO):
         format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S',
     )
+
+
+# ---------------------------------------------------------------------------
+# Run status file (logs/fetch_status.json) — available to local monitoring tools
+# ---------------------------------------------------------------------------
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOG_DIR = os.path.join(PROJECT_ROOT, 'logs')
+STATUS_FILE = os.path.join(LOG_DIR, 'fetch_status.json')
+_status_lock = threading.Lock()
+
+
+def record_fetch_status(source, summary):
+    """Merge one source's latest run into logs/fetch_status.json (atomic write).
+
+    Series-level entries are merged, so a filtered run (--series x) updates only
+    the series it touched while keeping the last result of the others.
+    """
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with _status_lock:
+            data = {}
+            if os.path.exists(STATUS_FILE):
+                try:
+                    with open(STATUS_FILE, encoding='utf-8') as f:
+                        data = json.load(f)
+                except Exception:
+                    data = {}
+            previous = data.get(source, {})
+            merged_series = dict(previous.get('series', {}))
+            merged_series.update(summary.get('series', {}))
+            summary = dict(summary, series=merged_series)
+            data[source] = summary
+            tmp = STATUS_FILE + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=1, default=str)
+            os.replace(tmp, STATUS_FILE)
+    except Exception as e:  # never let bookkeeping fail a fetch
+        logging.getLogger('status').warning(f"could not write {STATUS_FILE}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +346,8 @@ class BaseFetcher:
         for attempt in range(max_retries):
             try:
                 return func()
+            except AbortFetch:
+                raise
             except Exception as e:
                 self.logger.warning(f"  {tag} attempt {attempt+1}/{max_retries} failed: {e}")
                 if attempt < max_retries - 1:
@@ -312,18 +361,29 @@ class BaseFetcher:
         """Fetch and store data for one series. Override in subclasses."""
         raise NotImplementedError
 
-    def run(self, series_filter=None):
+    def run(self, series_filter=None, source_name=None):
         """Fetch all series (or a filtered subset).
 
         Args:
             series_filter: optional string — if given, only series whose
                 'table' contains this string will be fetched.
+            source_name: key used in logs/fetch_status.json (run.py passes the
+                CLI source name, e.g. 'fred'); defaults to the fetcher name.
         """
         setup_logging()
         self.logger.info(f"=== Starting {self.name} ===")
         start = datetime.now()
         success = 0
         failed = 0
+        results = {}   # table -> {'ok', 'error', 'duration_s', 'finished'}
+
+        def _record(table, t0, error=None):
+            results[table] = {
+                'ok': error is None,
+                'error': None if error is None else f"{type(error).__name__}: {error}"[:300],
+                'duration_s': round((datetime.now() - t0).total_seconds(), 1),
+                'finished': datetime.now().isoformat(timespec='seconds'),
+            }
 
         series_list = self.SERIES
         if series_filter:
@@ -339,29 +399,43 @@ class BaseFetcher:
                 for sc in series_list:
                     table = sc.get('table', 'unknown')
                     self.logger.info(f"Fetching: {table}")
-                    futures[executor.submit(self.fetch_series, sc)] = table
+                    futures[executor.submit(self.fetch_series, sc)] = (table, datetime.now())
                 for future in as_completed(futures):
-                    table = futures[future]
+                    table, t0 = futures[future]
                     try:
                         future.result()
                         success += 1
+                        _record(table, t0)
                     except Exception as e:
                         self.logger.exception(f"FAILED: {table} — {e}")
                         failed += 1
+                        _record(table, t0, e)
         else:
             for sc in series_list:
                 table = sc.get('table', 'unknown')
+                t0 = datetime.now()
                 try:
                     self.logger.info(f"Fetching: {table}")
                     self.fetch_series(sc)
                     success += 1
+                    _record(table, t0)
                 except Exception as e:
                     self.logger.exception(f"FAILED: {table} — {e}")
                     failed += 1
+                    _record(table, t0, e)
 
         elapsed = datetime.now() - start
         self.logger.info(
             f"=== {self.name} done: {success} OK, {failed} failed, "
             f"{elapsed.total_seconds():.1f}s ==="
         )
+        record_fetch_status(source_name or self.name, {
+            'fetcher': self.name,
+            'finished': datetime.now().isoformat(timespec='seconds'),
+            'duration_s': round(elapsed.total_seconds(), 1),
+            'ok': success,
+            'failed': failed,
+            'series_filter': series_filter,
+            'series': results,
+        })
         return failed == 0

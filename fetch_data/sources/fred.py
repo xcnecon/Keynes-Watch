@@ -5,9 +5,9 @@ Replaces the six standalone scripts:
     fred/claims.py   -> fred_claims            (multi-series, full refresh)
     fred/payrolls.py -> fred_payrolls_panel     (multi-series, full refresh)
     fred/ur.py       -> fred_unemployment       (multi-series, full refresh)
-    fred/cpi.py      -> fred_cpiaucl            (single-series, incremental)
-    fred/gdp.py      -> fred_gdp               (single-series, incremental)
-    fred/fed.py      -> fred_wresbal            (single-series, incremental)
+    fred/cpi.py      -> fred_cpiaucl            (single-series, full refresh)
+    fred/gdp.py      -> fred_gdp               (single-series, full refresh)
+    fred/fed.py      -> fred_wresbal            (single-series, full refresh)
                       + fedwire_monthly_stats   (custom HTML scrape)
 """
 
@@ -136,7 +136,7 @@ class FREDFetcher(BaseFetcher):
             'multi_series': True,
         },
 
-        # ---- Single-series tables (incremental) ----
+        # ---- Single-series tables (refresh revisions, including GDP estimates) ----
         {
             'table': 'fred_cpiaucl',
             'create_sql': """
@@ -146,7 +146,7 @@ class FREDFetcher(BaseFetcher):
                 )
             """,
             'series_ids': ["CPIAUCSL"],
-            'strategy': 'incremental',
+            'strategy': 'full',
             'date_column': 'observation_date',
             'columns': ['observation_date', 'value'],
             'update_columns': ['value'],
@@ -161,7 +161,7 @@ class FREDFetcher(BaseFetcher):
                 )
             """,
             'series_ids': ["GDP"],
-            'strategy': 'incremental',
+            'strategy': 'full',
             'date_column': 'observation_date',
             'columns': ['observation_date', 'value'],
             'update_columns': ['value'],
@@ -176,7 +176,7 @@ class FREDFetcher(BaseFetcher):
                 )
             """,
             'series_ids': ["WRESBAL"],
-            'strategy': 'incremental',
+            'strategy': 'full',
             'date_column': 'observation_date',
             'columns': ['observation_date', 'value'],
             'update_columns': ['value'],
@@ -295,13 +295,13 @@ class FREDFetcher(BaseFetcher):
             self._fetch_full(series_config)
 
     # ------------------------------------------------------------------
-    # Full-refresh strategy (multi-series tables)
+    # Full-refresh strategy (single- and multi-series tables)
     # ------------------------------------------------------------------
 
     def _fetch_full(self, sc):
         """Full-history refresh: fetch ALL observations for every series_id,
-        upsert into the table.  Used for claims / payrolls / unemployment
-        where FRED may revise historical data."""
+        upsert into the table. Includes GDP, CPI and reserves: a newer vintage
+        can revise a date that is already present in the database."""
         conn = self.get_connection()
         try:
             self.ensure_table(conn, sc['create_sql'])

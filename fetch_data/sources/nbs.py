@@ -3,7 +3,7 @@ NBSFetcher -- fetcher for National Bureau of Statistics data.
 
 Series:
     nbs_real_estate_climate    国房景气指数 (via AKShare)
-    nbs_house_price            70城住宅价格指数 — 汇总 + 分面积 (via NBS easyquery API, dbcode=csyd)
+    nbs_house_price            70城住宅价格指数 — 汇总 + 分面积 (via NBS 新版数据发布库 API「主要城市月度价格」+ 官方新闻稿回退)
     nbs_real_estate_macro      全国房地产月度宏观数据 — 9大类 (via NBS easyquery API, dbcode=hgyd)
     cn_flow_of_funds           资金流量表（非金融交易）年度 1992+ (via NBS 新版数据发布库 API)
     nbs_retail_sales           社会消费品零售总额月度 1984+ (via NBS 新版数据发布库 API + 官方新闻稿回退)
@@ -15,6 +15,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
@@ -33,23 +34,74 @@ _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-from fetch_data.base import BaseFetcher
+from fetch_data.base import BaseFetcher, AbortFetch
+
+
+class NBSThrottledError(AbortFetch):
+    """NBS v2 WAF 熔断已跳闸：本轮剩余 v2 请求直接放弃，等下次运行自愈。
+
+    网宿 WAF 按 IP 限流，触发后返回空 body 或直接掐断连接，且短时间内不会
+    恢复——继续逐城/逐叶重试只会延长封禁（2026-07-06 实测）。
+    """
+
 
 # ---------------------------------------------------------------------------
-# NBS easyquery API indicator codes for 70-city house price index
-# Parent: A0108 = "70个大中城市住宅销售价格指数"
+# 70城住宅销售价格指数（NBS 新版数据发布库「主要城市月度价格」，2026-07 迁移）
+# 旧 easyquery csyd 通道已 403。树根 code=7；叶子 = 70个大中城市住宅销售价格指数。
+# 取数按城市逐个请求（das = 12 位行政区划码）。
+# ⚠ 服务端对无效/多城市 das 会【静默回退返回北京】——2026-03 初次回填时
+#   由此把北京 180 个月历史写进了 15 个城市（含不在 70 城调查内的拉萨）。
+#   解析时必须校验响应 da_name 与请求城市一致，绝不能只信请求参数。
 # ---------------------------------------------------------------------------
-HOUSE_PRICE_INDICATORS = {
-    # (db_column_prefix, mom_code, yoy_code)
-    'new':           ('A010804', 'A010805'),   # 新建商品住宅
-    'used':          ('A010807', 'A010808'),   # 二手住宅
-    'new_90below':   ('A01080A', 'A01080B'),   # 新建 ≤90m²
-    'new_90to144':   ('A01080D', 'A01080E'),   # 新建 90-144m²
-    'new_144above':  ('A01080G', 'A01080H'),   # 新建 >144m²
-    'used_90below':  ('A01080J', 'A01080K'),   # 二手 ≤90m²
-    'used_90to144':  ('A01080M', 'A01080N'),   # 二手 90-144m²
-    'used_144above': ('A01080P', 'A01080Q'),   # 二手 >144m²
+NBS_V2_CITYPRICE_ROOT = '327ecbb2e6b14c669da1e99e39faa24c'  # 主要城市月度价格根目录
+HP_V2_CID = '3eb43764c74741469b745c396cf002d1'  # 70个大中城市住宅销售价格指数叶子
+
+# 表字段 -> 指标 UUID（queryIndicatorsByCid 枚举，2026-07 实测；
+# new=新建商品住宅、used=二手住宅；上月=100 → mom、上年同月=100 → yoy）
+HP_V2_INDICATORS = {
+    'new_mom':           '732f9cca00c84facb9bb8dd8365bc0e7',
+    'new_yoy':           'fb43046325f64e3896a96b70b071d52b',
+    'used_mom':          '05dd255eb4d54986a567d523b4403676',
+    'used_yoy':          '11ad09962ea7497eb2ccdf2be5719a20',
+    'new_90below_mom':   '25205b9fb3054cc89ff1d1e0fc4bc110',
+    'new_90below_yoy':   '2624e01a782d4f47a23610bd056570ae',
+    'new_90to144_mom':   '73a8b0fe738a482491ed17e9b28e0d85',
+    'new_90to144_yoy':   'cbcf12312fec43768ead1af77fd26ed0',
+    'new_144above_mom':  '93815f78b2d54fc98a34b9669be5467f',
+    'new_144above_yoy':  '757f2c9afc39420d89c47c30890d9de5',
+    'used_90below_mom':  '98fb96672e1c4666adb821e393499b46',
+    'used_90below_yoy':  'e9a41436e75841bc95eaadb21ab1f02e',
+    'used_90to144_mom':  '45871773323240bb91dddbfa5e2a1b55',
+    'used_90to144_yoy':  '0a73708bfa9e45798883a9b186b7f703',
+    'used_144above_mom': '3b970e6f7834459b909a2a9203242c2e',
+    'used_144above_yoy': 'dae265212c9f4e48bbbd9038362f628e',
 }
+
+HP_COL_ORDER = list(HP_V2_INDICATORS)  # 与 SERIES['columns'][2:] 顺序一致
+
+# 官方 70 个大中城市（短名 = 数据库 city 值，6 位行政区划码；拉萨不在调查范围）。
+# 2026-07 已逐城实测：v2 库覆盖 2011-01 起，da_name 回显与短名前缀匹配
+# （大理 → 大理白族自治州）。
+HP_CITIES = [
+    ('北京', '110000'), ('天津', '120000'), ('石家庄', '130100'), ('唐山', '130200'),
+    ('秦皇岛', '130300'), ('太原', '140100'), ('呼和浩特', '150100'), ('包头', '150200'),
+    ('沈阳', '210100'), ('大连', '210200'), ('丹东', '210600'), ('锦州', '210700'),
+    ('长春', '220100'), ('吉林', '220200'), ('哈尔滨', '230100'), ('牡丹江', '231000'),
+    ('上海', '310000'), ('南京', '320100'), ('无锡', '320200'), ('徐州', '320300'),
+    ('扬州', '321000'), ('杭州', '330100'), ('宁波', '330200'), ('温州', '330300'),
+    ('金华', '330700'), ('合肥', '340100'), ('蚌埠', '340300'), ('安庆', '340800'),
+    ('福州', '350100'), ('厦门', '350200'), ('泉州', '350500'), ('南昌', '360100'),
+    ('九江', '360400'), ('赣州', '360700'), ('济南', '370100'), ('青岛', '370200'),
+    ('烟台', '370600'), ('济宁', '370800'), ('郑州', '410100'), ('洛阳', '410300'),
+    ('平顶山', '410400'), ('武汉', '420100'), ('宜昌', '420500'), ('襄阳', '420600'),
+    ('长沙', '430100'), ('岳阳', '430600'), ('常德', '430700'), ('广州', '440100'),
+    ('韶关', '440200'), ('深圳', '440300'), ('湛江', '440800'), ('惠州', '441300'),
+    ('南宁', '450100'), ('桂林', '450300'), ('北海', '450500'), ('海口', '460100'),
+    ('三亚', '460200'), ('重庆', '500000'), ('成都', '510100'), ('泸州', '510500'),
+    ('南充', '511300'), ('贵阳', '520100'), ('遵义', '520300'), ('昆明', '530100'),
+    ('大理', '532900'), ('西安', '610100'), ('兰州', '620100'), ('西宁', '630100'),
+    ('银川', '640100'), ('乌鲁木齐', '650100'),
+]
 
 NBS_API_URL = 'https://data.stats.gov.cn/easyquery.htm'
 NBS_RELEASE_LIST_URL = 'https://www.stats.gov.cn/sj/zxfb/'
@@ -364,9 +416,15 @@ RETAIL_FIELDS = ['monthly_value', 'monthly_yoy', 'ytd_value', 'ytd_yoy']
 class NBSFetcher(BaseFetcher):
     """Fetches NBS real estate data."""
 
+    # WAF 熔断：连续这么多次"空响应/连接被掐"即认定被限流，中止本轮 v2 请求
+    WAF_STRIKE_LIMIT = 5
+
     def __init__(self):
         super().__init__()
         self._setup_cn_proxy()
+        self._waf_strikes = 0
+        self._waf_tripped = False
+        self._waf_lock = threading.Lock()
 
     SERIES = [
         {
@@ -525,10 +583,7 @@ class NBSFetcher(BaseFetcher):
         if getattr(self, attr, False):
             return False
         try:
-            if probe == 'house':
-                self._nbs_query('A010804', period='LAST1')
-            else:
-                self._nbs_macro_query('A0601', period='LAST1')
+            self._nbs_macro_query('A0601', period='LAST1')
             return True
         except Exception as exc:
             setattr(self, attr, True)
@@ -608,45 +663,105 @@ class NBSFetcher(BaseFetcher):
             ))
         return rows
 
-    # -- 70-city house price (NBS easyquery API) ----------------------------
+    # -- NBS v2 API 统一入口（带 WAF 熔断） -----------------------------------
 
-    def _nbs_query(self, indicator_code, period='LAST180'):
-        """Query NBS easyquery API for one indicator across all 70 cities.
-        Returns dict: { (YYYYMM, region_code): value }
+    def _waf_strike(self, why):
+        """记一次 WAF 特征失败；连续 WAF_STRIKE_LIMIT 次即跳闸。"""
+        with self._waf_lock:
+            self._waf_strikes += 1
+            strikes = self._waf_strikes
+            just_tripped = (strikes >= self.WAF_STRIKE_LIMIT
+                            and not self._waf_tripped)
+            if just_tripped:
+                self._waf_tripped = True
+        self.logger.warning(
+            f"  WAF strike {strikes}/{self.WAF_STRIKE_LIMIT}: {why}")
+        if just_tripped:
+            self.logger.error(
+                "  NBS v2 WAF throttle detected — aborting all remaining v2 "
+                "requests this run; next scheduled run will retry")
+
+    def _v2_post_json(self, payload, label, pause=0.0):
+        """POST {NBS_V2_BASE}/stream/esData 并解析 JSON，带 WAF 熔断。
+
+        限流特征（空 body → JSON 在 char 0 解析失败、连接被远端掐断、
+        403/429）计 strike；连续 WAF_STRIKE_LIMIT 次后跳闸，此后所有 v2
+        请求立即抛 NBSThrottledError（AbortFetch 子类，retry_call 不再重试
+        也不再 backoff 睡眠）。新闻稿回退走 www.stats.gov.cn，不受影响。
         """
-        params = {
-            'm': 'QueryData',
-            'dbcode': 'csyd',
-            'rowcode': 'reg',
-            'colcode': 'sj',
-            'wds': json.dumps([{'wdcode': 'zb', 'valuecode': indicator_code}]),
-            'dfwds': json.dumps([{'wdcode': 'sj', 'valuecode': period}]),
-            'k1': str(int(time.time() * 1000)),
+        with self._waf_lock:
+            if self._waf_tripped:
+                raise NBSThrottledError(
+                    f"{label}: skipped — NBS v2 WAF throttled earlier in this run")
+        if pause:
+            self.rate_limit_pause(pause)
+        try:
+            r = self.session.post(f'{NBS_V2_BASE}/stream/esData', json=payload,
+                                  headers=NBS_V2_HEADERS, timeout=120,
+                                  verify=False)
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.RetryError) as e:
+            self._waf_strike(f"{label}: connection dropped "
+                             f"({e.__class__.__name__})")
+            raise
+        if r.status_code in (403, 429):
+            self._waf_strike(f"{label}: HTTP {r.status_code}")
+            raise ValueError(f"NBS v2 {label} HTTP {r.status_code} (WAF?)")
+        if r.status_code != 200:
+            snippet = r.text[:200].replace('\n', ' ')
+            raise ValueError(f"NBS v2 {label} HTTP {r.status_code}: {snippet}")
+        try:
+            data = r.json()
+        except ValueError:
+            self._waf_strike(f"{label}: empty/non-JSON body")
+            raise ValueError(
+                f"NBS v2 {label}: empty/non-JSON response (WAF throttle?)")
+        with self._waf_lock:
+            self._waf_strikes = 0
+        return data
+
+    # -- 70-city house price (NBS 新版数据发布库 API) ---------------------------
+
+    def _nbs_v2_house_city(self, city, code6, dts):
+        """单城市取 16 个房价指标。返回 {date: {column: float}}。
+
+        das 只支持单城市；无效码/多城市会被服务端【静默回退成北京】，
+        故必须校验 da_name 回显（2026-03 数据污染事故根因，勿删）。
+        """
+        payload = {
+            'cid': HP_V2_CID,
+            'indicatorIds': list(HP_V2_INDICATORS.values()),
+            'daCatalogId': '',
+            'das': [{'text': city, 'value': code6 + '000000'}],
+            'showType': '1',
+            'dts': [dts],
+            'rootId': NBS_V2_CITYPRICE_ROOT,
         }
-        r = requests.get(NBS_API_URL, params=params, timeout=120, verify=False,
-                         headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'},
-                         proxies=self._cn_proxies)
-        data = self._nbs_json(r)
-        if data.get('returncode') != 200:
-            raise ValueError(f"NBS API error: {data.get('returncode')}")
+        # 网宿 WAF 对突发请求限流（返回非 JSON），必须控制节奏
+        data = self._v2_post_json(payload, f'hp_{city}', pause=0.5)
+        if data.get('state') != 20000:
+            raise ValueError(f"NBS v2 esData error: {str(data)[:200]}")
 
-        nodes = data['returndata']['datanodes']
-        result = {}
-        for n in nodes:
-            wds_map = {wd['wdcode']: wd['valuecode'] for wd in n['wds']}
-            reg = wds_map['reg']
-            sj = wds_map['sj']
-            val = n['data']['data'] if n['data']['hasdata'] else None
-            result[(sj, reg)] = val
-
-        # Extract region names
-        region_names = {}
-        for w in data['returndata']['wdnodes']:
-            if w.get('wdcode') == 'reg':
-                for node in w['nodes']:
-                    region_names[node['code']] = node['cname']
-
-        return result, region_names
+        iid_to_col = {iid: col for col, iid in HP_V2_INDICATORS.items()}
+        out = {}
+        for block in data.get('data') or []:
+            code = block.get('code') or ''
+            try:
+                record_date = pd.to_datetime(code[:6], format='%Y%m').date()
+            except Exception:
+                continue
+            for v in block.get('values') or []:
+                da_name = v.get('da_name') or ''
+                if not da_name.startswith(city):
+                    raise ValueError(
+                        f"NBS v2 returned region {da_name!r} for requested {city!r} "
+                        f"(silent-default footgun)")
+                col = iid_to_col.get(v.get('_id'))
+                val = self._to_float(v.get('value'))
+                if col is None or val is None:
+                    continue
+                out.setdefault(record_date, {})[col] = val
+        return out
 
     def _overall_house_block_starts(self, table):
         headers = [self._clean_cn_text(v) for v in table.iloc[0]]
@@ -771,88 +886,71 @@ class NBSFetcher(BaseFetcher):
         return rows
 
     def _fetch_house_price(self, period='LAST180', latest_date=None):
-        """Fetch all 70-city house price indicators via NBS easyquery API.
-        Makes 16 API calls (8 indicators × mom/yoy) in parallel (5 threads).
-        Period: LAST13 for incremental, LAST180 for full refresh.
+        """Fetch all 70-city house price indicators via NBS v2 API（主要城市月度价格库）.
+        Makes 70 API calls (one per city, 16 indicators each) in parallel (5 threads).
+        Period: LAST13 for incremental, LAST180 for full refresh (2011-01 起).
+        任一城市失败则整体 raise——upsert 无法回滚，宁可整轮不写也不留残缺。
         """
+        today = date.today()
+        if period == 'LAST13' and latest_date:
+            start = (pd.Timestamp(latest_date) - pd.DateOffset(months=13)).date()
+        else:
+            start = date(2011, 1, 1)
+        dts = f"{start:%Y%m}MM-{today:%Y%m}MM"
 
-        # Collect all data: key = (period, region_code), value = dict of column values
-        all_data = {}
-        region_names = {}
+        # 可用性探针：v2 不可达时直接走新闻稿回退，别让 70 城各自重试到超时
+        try:
+            self.retry_call(
+                lambda: self._nbs_v2_house_city('北京', '110000',
+                                                f"{today:%Y%m}MM-{today:%Y%m}MM"),
+                max_retries=3, backoff=5, label='nbs_hp_probe')
+            api_ok = True
+        except Exception as exc:
+            self.logger.warning(
+                f"  NBS v2 city-price API unavailable; using official releases: {exc}")
+            api_ok = False
+
+        rows = []
         errors = []
-
-        # Build task list: (column_name, indicator_code)
-        tasks = []
-        for prefix, (mom_code, yoy_code) in HOUSE_PRICE_INDICATORS.items():
-            tasks.append((f'{prefix}_mom', mom_code))
-            tasks.append((f'{prefix}_yoy', yoy_code))
-
-        # Fetch all 16 indicators in parallel (5 threads)
-        if self._easyquery_available('house'):
-            with ThreadPoolExecutor(max_workers=5) as executor:
+        api_cities = 0
+        if api_ok:
+            # 并发别超过 2：WAF 会对突发流量整段封锁（linear backoff 给冷却期）
+            with ThreadPoolExecutor(max_workers=2) as executor:
                 futures = {
                     executor.submit(
                         self.retry_call,
-                        lambda ic=code, p=period: self._nbs_query(ic, period=p),
-                        max_retries=2,
-                        backoff=2,
-                        label=f'nbs_{code}',
-                    ): (col, code)
-                    for col, code in tasks
+                        lambda c=city, k=code, d=dts: self._nbs_v2_house_city(c, k, d),
+                        max_retries=4,
+                        backoff=10,
+                        label=f'nbs_hp_{city}',
+                    ): city
+                    for city, code in HP_CITIES
                 }
                 for future in as_completed(futures):
-                    col_name, indicator_code = futures[future]
+                    city = futures[future]
                     try:
-                        result, rnames = future.result()
-                        region_names.update(rnames)
-                        for (sj, reg), val in result.items():
-                            key = (sj, reg)
-                            if key not in all_data:
-                                all_data[key] = {}
-                            all_data[key][col_name] = val
-                        self.logger.info(f"  {indicator_code} ({col_name}): {len(result)} values")
+                        city_data = future.result()
+                        for record_date, vals in sorted(city_data.items()):
+                            row = [record_date, city]
+                            row.extend(vals.get(col) for col in HP_COL_ORDER)
+                            if any(v is not None for v in row[2:]):
+                                rows.append(tuple(row))
+                        api_cities += 1
                     except Exception as e:
-                        self.logger.error(f"  {indicator_code} ({col_name}) FAILED: {e}")
-                        errors.append((indicator_code, col_name, e))
+                        if isinstance(e, NBSThrottledError):
+                            self.logger.warning(f"  {city}: skipped (WAF throttled)")
+                        else:
+                            self.logger.error(f"  {city} FAILED: {e}")
+                        errors.append((city, e))
 
-        if errors:
-            failed = ', '.join(
-                f'{code}/{col}' for code, col, _exc in errors
-            )
-            raise RuntimeError(
-                f"Partial NBS house-price fetch failed for "
-                f"{len(errors)} indicator(s): {failed}"
-            )
+            if errors:
+                # upsert 不可回滚：部分城市成功、部分失败时宁可整轮放弃
+                failed = ', '.join(city for city, _exc in errors)
+                raise RuntimeError(
+                    f"Partial NBS house-price fetch failed for "
+                    f"{len(errors)} city/cities: {failed}")
 
-        # Convert to rows
-        col_order = [
-            'new_mom', 'new_yoy', 'used_mom', 'used_yoy',
-            'new_90below_mom', 'new_90below_yoy',
-            'new_90to144_mom', 'new_90to144_yoy',
-            'new_144above_mom', 'new_144above_yoy',
-            'used_90below_mom', 'used_90below_yoy',
-            'used_90to144_mom', 'used_90to144_yoy',
-            'used_144above_mom', 'used_144above_yoy',
-        ]
-        rows = []
-        unmapped_codes = set()
-        for (sj, reg), vals in all_data.items():
-            try:
-                record_date = pd.to_datetime(sj, format='%Y%m').date()
-            except Exception:
-                continue
-            city = region_names.get(reg)
-            if city is None:
-                unmapped_codes.add(reg)
-                city = reg
-            row = [record_date, city]
-            for col in col_order:
-                row.append(self._to_float(vals.get(col)))
-            rows.append(tuple(row))
-
-        if unmapped_codes:
-            self.logger.warning(f"  Unmapped region codes (stored as raw code): {unmapped_codes}")
-        self.logger.info(f"  Total: {len(rows)} rows across {len(region_names)} cities")
+        self.logger.info(f"  Total: {len(rows)} rows across {api_cities} cities")
         max_date = max((r[0] for r in rows), default=None)
         release_after = max_date or (latest_date - timedelta(days=1) if latest_date else None)
         try:
@@ -1038,7 +1136,10 @@ class NBSFetcher(BaseFetcher):
                         cat_rows = future.result()
                         rows.extend(cat_rows)
                     except Exception as e:
-                        self.logger.error(f"  {zb_code} ({cat_name}) FAILED: {e}")
+                        if isinstance(e, NBSThrottledError):
+                            self.logger.warning(f"  {zb_code} ({cat_name}): skipped (WAF throttled)")
+                        else:
+                            self.logger.error(f"  {zb_code} ({cat_name}) FAILED: {e}")
                         errors.append((zb_code, e))
 
         if errors:
@@ -1089,12 +1190,7 @@ class NBSFetcher(BaseFetcher):
             'dts': [dts],
             'rootId': root_id,
         }
-        r = self.session.post(f'{NBS_V2_BASE}/stream/esData', json=payload,
-                              headers=NBS_V2_HEADERS, timeout=120, verify=False)
-        if r.status_code != 200:
-            snippet = r.text[:200].replace('\n', ' ')
-            raise ValueError(f"NBS v2 esData HTTP {r.status_code}: {snippet}")
-        data = r.json()
+        data = self._v2_post_json(payload, f'esData_{cid[:8]}')
         if data.get('state') != 20000:
             raise ValueError(f"NBS v2 esData error: {str(data)[:200]}")
         return data['data']
@@ -1207,6 +1303,11 @@ class NBSFetcher(BaseFetcher):
         容忍 增长/下降/持平 等任意结尾；「1—M月份」取 M；单独「1月份」不存在，
         防御性返回 None（1 月无单独发布，避免误建 1 月行）。
         """
+        title = re.sub(r'\s+', '', title)
+        named = re.search(r'(\d{4})年(上半年|前三季度|一季度|全年)社会消费品零售总额', title)
+        if named:
+            month = {'上半年': 6, '前三季度': 9, '一季度': 3, '全年': 12}[named[2]]
+            return date(int(named[1]), month, 1)
         m = re.search(r'(\d{4})年(1[—–-])?(\d{1,2})月份?'
                       r'社会消费品零售总额', title)
         if not m:
@@ -1365,6 +1466,9 @@ class NBSFetcher(BaseFetcher):
             except Exception as exc:
                 if cid in core_cids:
                     core_fail += 1
+                if isinstance(exc, NBSThrottledError):
+                    self.logger.warning(f"  Retail leaf {cid[:8]}: skipped (WAF throttled)")
+                elif cid in core_cids:
                     self.logger.error(f"  Retail CORE leaf {cid[:8]} failed: {exc}")
                 else:
                     self.logger.warning(
@@ -1422,13 +1526,14 @@ class NBSFetcher(BaseFetcher):
                     f"'total' (expected ~500+); refusing to write")
 
         # -- 新闻稿：常态补最新期 + API 不可用时灾备 --------------------------
-        release_after = api_max_date or (
-            latest_date - timedelta(days=1) if latest_date else None)
+        # Revisit recent releases even when a later month exists in the API.
+        # Otherwise a missed June ('上半年') can never be repaired after July.
+        anchor = api_max_date or latest_date
+        release_after = anchor - timedelta(days=370) if anchor else None
         try:
-            # API 已供数时新闻稿只需补最新一期，列表翻 2 页（约 2 个月）足够；
-            # 灾备（API 无数据）时翻全 8 页拿最大深度
+            # 回看发布列表，补齐曾被标题解析漏掉的月份（例如「上半年」）。
             release_cells = self._fetch_retail_releases(
-                after_date=release_after, max_pages=2 if cells else 8)
+                after_date=release_after, max_pages=8)
         except Exception as exc:
             if not cells:
                 raise
@@ -1470,14 +1575,15 @@ class NBSFetcher(BaseFetcher):
             self._last_fetch_partial = False
 
             # Incremental: LAST13 if table has data, LAST180 if empty
+            # (NBS_HOUSE_FULL=1 强制全量 2011-01 起重灌，用于历史数据修复)
             if func_name == '_fetch_house_price':
                 latest = self.get_latest_date(conn, table)
-                if latest:
+                if latest and os.environ.get('NBS_HOUSE_FULL') != '1':
                     period = 'LAST13'
                     self.logger.info(f"  Fetching {table} (incremental LAST13, latest: {latest})...")
                 else:
                     period = 'LAST180'
-                    self.logger.info(f"  Fetching {table} (full LAST180, table empty)...")
+                    self.logger.info(f"  Fetching {table} (full LAST180 = 2011-01+)...")
                 rows = fetch_func(period=period, latest_date=latest)
             elif func_name in ('_fetch_real_estate_macro', '_fetch_retail_sales'):
                 latest = self.get_latest_date(conn, table)

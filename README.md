@@ -1,80 +1,56 @@
 # Keynes Watch — Data Pipeline
 
-This is the open-source ETL behind [keyneswatch.com](https://keyneswatch.com/),
-a free, auto-updating library of the macro data that rates and macro investors
-actually trade on:
+Keynes Watch collects U.S. and Chinese macroeconomic data into MySQL tables
+and local CSV files. This is the standalone data pipeline originally used by
+[keyneswatch.com](https://keyneswatch.com/), released under the [MIT License](LICENSE).
+It contains no Flask application, charts, or website deployment configuration.
 
-- **U.S. — Fed & money markets**: EFFR vs the target range, SOFR percentiles and
-  volume, NY Fed repo/reverse-repo operations, reserve balances scaled by GDP and
-  Fedwire volume, nominal and TIPS yield curves
-- **U.S. — Treasury supply & fiscal flows**: outstanding debt by instrument,
-  weighted average maturity and interest rates, the daily TGA balance, the debt
-  limit, and the Monthly Treasury Statement
-- **U.S. — Labor, in real time**: daily withheld income/payroll taxes (a
-  census-like wage-bill proxy weeks ahead of payrolls), CES payrolls, UI claims,
-  unemployment detail, Indeed posted wages and job postings
-- **U.S. — Profits & sectoral balances**: the Kalecki–Levy profits equation and
-  Godley-style three-sector balances, built quarterly from BEA NIPA
-- **China — PBOC & credit**: the rate corridor (SHIBOR/SLF/IOER/OMO), LPR, RRR,
-  money supply, the PBOC balance sheet, total social financing and new loans
-- **China — Economic activity**: total retail sales of consumer goods (monthly
-  since 1984) with urban/rural, catering/goods, 16 above-quota category and
-  online-retail splits
-- **China — Property & land finance**: NBS real estate macro, 70-city house
-  prices, and MOF land transfer revenue
-- **China — Profits & sectoral balances**: the same Kalecki-equation and
-  three-sector-balance identities rebuilt annually (1992+) from the NBS
-  flow-of-funds accounts (non-financial transactions)
+**项目安排：** 网站后续不再持续维护更新；本仓库保留为可独立运行的数据采集项目。
+需要最新数据的使用者，请配置自己的数据库、API 密钥并运行或定时执行采集程序。
+本次整理仅更新采集代码与文档，不执行线上停更、关站或部署操作。
 
-Every series is pulled programmatically from primary sources — the NY Fed
-Markets API, Treasury Fiscal Data, BEA, FRED, PBOC, NBS, and MOF — never rekeyed
-from secondary aggregators, and refreshes automatically as new data are
-released.
+The hosted website is planned to leave regular maintenance. This repository
+lets you run the pipeline yourself; it does not provide a hosted data feed or
+promise continued updates to upstream integrations. Updates run only when you
+invoke the fetchers or configure your own scheduler. Historical coverage and
+availability depend on each source.
 
-The site is built and maintained by [Chenning Xu](https://www.linkedin.com/in/chenning-xu/),
-a Hong Kong-based hedge fund research analyst covering global macro with a focus
-on rates ([email](mailto:chenningxuecon@gmail.com)).
+The project was created by [Chenning Xu](https://www.linkedin.com/in/chenning-xu/).
+The September 2026 synchronization is described in
+[the comparison and migration notes](docs/sync-2026-09-19.md).
 
-This repository contains the fetcher code and safe configuration examples;
-it does not include production secrets, logs, certificates, downloaded datasets,
-or server deployment files.
-
-## Data Sources
-
-The unified runner in `fetch_data/run.py` can update these source groups:
+## Data sources
 
 | Source | Main tables / files |
 | --- | --- |
-| `fred` | FRED claims, payrolls, unemployment, CPI, GDP, reserve balances, Fedwire monthly stats |
+| `fred` | Claims, payrolls, unemployment, CPI, GDP, reserve balances, Fedwire monthly statistics |
 | `bea` | BEA NIPA data for the Kalecki equation and three-sector balances |
-| `fiscal` | Treasury Fiscal Data API tables: TGA balance, debt limit, Treasury outstanding, average maturity, average yields, MTS, withheld tax |
-| `nyfed` | New York Fed repo operations and overnight rates |
+| `fiscal` | TGA balance, debt limit, Treasury outstanding, average maturity, average yields, Monthly Treasury Statement, withheld tax |
+| `nyfed` | New York Fed repo / reverse-repo operations and overnight rates |
 | `treasury` | Nominal and real Treasury yield curves |
 | `indeed` | Indeed Hiring Lab wage and job-posting CSV snapshots |
-| `pboc` | PBOC LPR, money supply, social financing, credit, reserve ratios, SHIBOR, policy rates, balance sheet, OMO |
-| `nbs` | NBS China real estate climate, house prices, macro real estate indicators, annual flow-of-funds accounts, and monthly retail sales of consumer goods (via the NBS data-release-library API launched June 2026, with official press-release fallback) |
-| `mof` | China Ministry of Finance land transfer revenue from monthly fiscal reports |
+| `pboc` | LPR, money supply, social financing, credit, reserve ratios, SHIBOR, policy rates, balance sheet, OMO, FR/FDR repo fixing rates |
+| `nbs` | Real estate climate, 70-city house prices, macro real estate indicators, annual flow-of-funds accounts, monthly retail sales |
+| `mof` | Land transfer revenue from monthly fiscal reports |
 
-Most sources write into MySQL tables and create those tables if they do not
-exist. The `indeed` source writes CSV files under `fetch_data/github/`; generated
-CSV and metadata files are intentionally ignored by git.
+The fetchers use official APIs and releases, AKShare adapters, and Indeed's
+published datasets. Some policy-rate history is maintained as seed values in
+the code. See the source modules for endpoints, units, and transformation rules.
+
+Most sources create their own tables in an **existing** MySQL database. The
+`indeed` source writes files under `fetch_data/github/` and does not need MySQL
+or an API key. Downloaded data is excluded from git; the small public examples
+under `tests/fixtures/` are regression inputs, not a distributable dataset.
 
 ## Setup
 
-Requirements:
-
-- Python 3.11 or newer
-- MySQL-compatible database
-- FRED API key for `fred`
-- BEA API key for `bea`
-- Optional proxy for China data sources if your network needs one
-
-Install dependencies:
+Use Python 3.11 (the tested version) and MySQL. From the repository root:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
+cp .env.example .env
 ```
 
 On Windows PowerShell:
@@ -82,96 +58,124 @@ On Windows PowerShell:
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
 ```
 
-Create local configuration:
+Create your database using a MySQL administrator account, for example:
 
-```bash
-cp .env.example .env
+```sql
+CREATE DATABASE keyneswatch CHARACTER SET utf8mb4;
 ```
 
-Then edit `.env` with your local database and API credentials. `.env` is ignored
-by git and should not be committed.
+Configure your own database user with permission to read/write data and create
+or alter tables and indexes in that database. Populate `.env` with its connection
+details. Fetchers do not create the database or database user.
 
-## Configuration
+| Variable | Required for | Description |
+| --- | --- | --- |
+| `DB_HOST` | Database-backed sources | MySQL host |
+| `DB_PORT` | Optional | MySQL port; defaults to `3306` |
+| `DB_USER` | Database-backed sources | MySQL user |
+| `DB_PASSWORD` | Database-backed sources | MySQL password |
+| `DB_NAME` | Database-backed sources | Existing database name |
+| `FRED_API_KEY` | `fred` | Your FRED API key |
+| `BEA_API_KEY` | `bea` | Your BEA API key |
+| `CN_PROXY` | Optional | HTTP/SOCKS proxy URL for supported China fetchers |
 
-Required environment variables:
-
-| Variable | Description |
-| --- | --- |
-| `DB_HOST` | MySQL host |
-| `DB_PORT` | MySQL port, usually `3306` |
-| `DB_USER` | MySQL user |
-| `DB_PASSWORD` | MySQL password |
-| `DB_NAME` | MySQL database name |
-| `FRED_API_KEY` | FRED API key |
-| `BEA_API_KEY` | BEA API key |
-
-Optional:
-
-| Variable | Description |
-| --- | --- |
-| `CN_PROXY` | HTTP/SOCKS proxy URL used by China data fetchers |
-
-The code never needs production server paths. If `CN_PROXY` is set, logs only
-state that a proxy is configured; the proxy value is not printed.
+`.env` is ignored by git. No production credentials, certificates, database
+exports, or private server settings are needed.
 
 ## Usage
 
-List available source groups and target tables:
+List source groups and target tables without fetching data or connecting to MySQL:
 
 ```bash
 python -m fetch_data.run --list
 ```
 
-Run every source:
+Run all sources, one source, or a matching table group:
 
 ```bash
 python -m fetch_data.run
-```
-
-Run one source:
-
-```bash
 python -m fetch_data.run --source fred
-```
-
-Run one table group by substring:
-
-```bash
 python -m fetch_data.run --source fred --series claims
+python -m fetch_data.run --source pboc --series repo_fixing
 ```
 
-Run the generic update script:
+The first run can take considerably longer than subsequent updates. Run only
+the sources you need. A failed series causes the runner to return a nonzero
+exit code; other series still run. Re-running accepts revisions or resumes
+incremental downloads according to each source's strategy.
+
+The optional Bash helper creates a virtual environment if needed and installs
+requirements when they change. It resolves paths from the checkout, so it can
+be run from any working directory:
 
 ```bash
 bash scripts/update_all.sh
-```
-
-Run a subset with the script:
-
-```bash
 FETCH_SOURCES="fred bea fiscal" bash scripts/update_all.sh
 ```
 
-## Privacy Notes
+It supports `PROJECT_DIR`, `VENV_DIR`, `LOG_FILE`, and `FETCH_SOURCES` overrides.
+Its console output is also saved to `update.log` by default. On Windows, use
+the Python commands above, or run the helper through Git Bash.
 
-The public repository intentionally excludes:
+For unattended updates, configure your own cron job or Windows Task Scheduler
+task. For example, a daily cron entry (in the machine's local timezone):
 
-- `.env` and other environment files containing local secrets
-- TLS certificates and private keys
-- server logs and update logs
-- virtual environments and bytecode caches
-- downloaded Indeed CSV snapshots and metadata
-- production startup scripts tied to a specific host
-
-Before publishing, run:
-
-```bash
-rg -n "(BEGIN .*PRIVATE|password=|token=|api_key=|/root/|C:\\\\Users|production-domain\\.com)" .
+```cron
+0 9 * * * /bin/bash /path/to/Keynes-Watch/scripts/update_all.sh
 ```
 
-Review any matches manually. Environment variable names such as
-`DB_PASSWORD`, `FRED_API_KEY`, and `BEA_API_KEY` are expected; actual secret
-values should never appear in the repository.
+Each source run records series outcomes, durations, and errors in
+`logs/fetch_status.json`. A filtered run preserves the previous results for
+untouched series; check each series' `finished` timestamp when assessing
+freshness. This file is local runtime state and is ignored by git. Schedule
+runs sequentially within a checkout; status-file locking is process-local.
+
+## Updating an existing database
+
+Ordinary runs now re-read revised FRED observations, repair MTS fiscal-year
+mapping and Treasury maturity summaries, refill lagging NY Fed operation types,
+and correct PBOC zero-allotment notices to a NULL rate with zero volume.
+See [migration notes](docs/sync-2026-09-19.md) for targeted commands.
+
+NBS house prices use the newer city-price API with response-city validation;
+retail sales and flow-of-funds also use the newer data-release API. Official
+press releases provide fallbacks where implemented. NBS throttling can stop
+API requests for the remainder of a run; retry later instead of increasing
+parallelism. The national real-estate macro fetcher still uses the legacy
+easyquery endpoint with a press-release fallback.
+
+Optional NBS full-history refreshes, in Bash:
+
+```bash
+NBS_HOUSE_FULL=1 python -m fetch_data.run --source nbs --series house_price
+NBS_RETAIL_FULL=1 python -m fetch_data.run --source nbs --series retail_sales
+```
+
+In PowerShell, set `$env:NBS_HOUSE_FULL = '1'` (or `NBS_RETAIL_FULL`), run the
+corresponding Python command, then remove the temporary setting with
+`Remove-Item Env:NBS_HOUSE_FULL` (or `Env:NBS_RETAIL_FULL`).
+
+## Tests
+
+```bash
+python -m pip install -r requirements-test.txt
+python -m pytest -q
+python -m compileall -q fetch_data
+```
+
+Tests use curated public fixtures and isolated database/network substitutes;
+they do not load `.env` or update external data. CI runs these checks and CLI
+discovery without API keys or a live database. It does not deploy the website
+or schedule data collection. Tests verify parsing and update behavior, not
+the continued availability of every external endpoint.
+
+## License and repository scope
+
+[MIT](LICENSE) applies to this project's code. Upstream data remains subject
+to its providers' terms. Keep local secrets, downloaded datasets, logs,
+certificates, and database dumps out of commits. The website code and its
+deployment history are maintained separately from this data-only repository.

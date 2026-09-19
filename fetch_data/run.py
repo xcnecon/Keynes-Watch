@@ -124,7 +124,7 @@ def main():
             continue
 
         fetcher = cls()
-        ok = fetcher.run(series_filter=args.series)
+        ok = fetcher.run(series_filter=args.series, source_name=name)
         if not ok:
             all_ok = False
 
