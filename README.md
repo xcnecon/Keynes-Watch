@@ -1,23 +1,178 @@
 # Keynes Watch — Data Pipeline
 
 Keynes Watch collects U.S. and Chinese macroeconomic data into MySQL tables
-and local CSV files. This is the standalone data pipeline originally used by
+and local CSV files. This is the standalone data pipeline that powered
 [keyneswatch.com](https://keyneswatch.com/), released under the [MIT License](LICENSE).
-It contains no Flask application, charts, or website deployment configuration.
+It contains no Flask application, charts, or website deployment configuration;
+the [gallery](#what-the-data-looked-like-on-keyneswatchcom) below shows what the
+site built from these tables.
 
-**项目安排：** 网站后续不再持续维护更新；本仓库保留为可独立运行的数据采集项目。
+**项目安排：** keyneswatch.com 网站已下线；本仓库保留为可独立运行的数据采集项目。
 需要最新数据的使用者，请配置自己的数据库、API 密钥并运行或定时执行采集程序。
-本次整理仅更新采集代码与文档，不执行线上停更、关站或部署操作。
+网站各页面的截图见下文画廊。
 
-The hosted website is planned to leave regular maintenance. This repository
-lets you run the pipeline yourself; it does not provide a hosted data feed or
-promise continued updates to upstream integrations. Updates run only when you
+The hosted website has been taken offline. This repository lets you run the
+pipeline yourself; it does not provide a hosted data feed or promise continued
+updates to upstream integrations. Updates run only when you
 invoke the fetchers or configure your own scheduler. Historical coverage and
 availability depend on each source.
 
 The project was created by [Chenning Xu](https://www.linkedin.com/in/chenning-xu/).
 The September 2026 synchronization is described in
 [the comparison and migration notes](docs/sync-2026-09-19.md).
+
+## What the data looked like on keyneswatch.com
+
+The website rendered these tables as interactive Plotly pages behind a Flask
+app. The screenshots below come from a local run of that site in September
+2026 against a database filled by this pipeline. Each caption names the
+table(s) the chart reads, so you can find the matching fetcher below.
+
+<p align="center">
+  <img src="docs/screenshots/home.png" alt="Keynes Watch home page" width="900">
+</p>
+
+### United States
+
+<table>
+<tr>
+<td width="50%" valign="top">
+<b>Monthly Treasury Statement</b><br>
+Calendar year-to-date deficit, one line per year. Table <code>mts</code>.<br><br>
+<img src="docs/screenshots/us_mts.png" alt="Monthly Treasury Statement, deficit YTD by year">
+</td>
+<td width="50%" valign="top">
+<b>Weighted average maturity</b><br>
+Face-value-weighted remaining maturity of marketable Treasury debt, computed by this pipeline from security-level MSPD records. Table <code>treasury_average_maturity</code>.<br><br>
+<img src="docs/screenshots/us_average_treasury_maturities.png" alt="Treasury weighted average maturity since 2001">
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<b>Kalecki profits equation</b><br>
+Corporate profits decomposed quarterly from NIPA into investment, government saving, foreign saving, dividends and personal saving. Table <code>kalecki_equation</code>.<br><br>
+<img src="docs/screenshots/us_kalecki_equation.png" alt="Kalecki profits equation, quarterly">
+</td>
+<td width="50%" valign="top">
+<b>Sectoral financial balances</b><br>
+Private, government and foreign net lending as a share of GDP; the three sum to zero by identity. Table <code>kalecki_equation</code>.<br><br>
+<img src="docs/screenshots/us_three_sector_balance.png" alt="Three-sector financial balances">
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<b>Overnight rates: EFFR and SOFR</b><br>
+The SOFR percentile distribution and the effective funds rate inside the FOMC target range. Table <code>onrates</code>.<br><br>
+<img src="docs/screenshots/us_stir.png" alt="EFFR and SOFR percentiles within the target range">
+</td>
+<td width="50%" valign="top">
+<b>Reserve balances scaled by GDP</b><br>
+Reserve balances at the Fed divided by nominal GDP. Tables <code>fred_wresbal</code> and <code>fred_gdp</code>.<br><br>
+<img src="docs/screenshots/us_reserve.png" alt="Reserve balances relative to nominal GDP">
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<b>Treasury General Account</b><br>
+Daily closing balance, including the 2023 debt-limit drawdown and rebuild. Table <code>tga_balance</code>.<br><br>
+<img src="docs/screenshots/us_tga_balance.png" alt="Daily TGA balance">
+</td>
+<td width="50%" valign="top">
+<b>Withheld taxes</b><br>
+Daily withheld income and payroll taxes, cumulative year-to-date and aligned by calendar position. Table <code>withheld_tax</code>.<br><br>
+<img src="docs/screenshots/us_withheld_tax.png" alt="Withheld taxes cumulative YTD by year">
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<b>Treasury debt held by the public, share of GDP</b><br>
+Total public debt held by the public, from the MSPD, divided by nominal GDP. Tables <code>total_debt_outstanding</code> and <code>fred_gdp</code>.<br><br>
+<img src="docs/screenshots/us_treasuries_outstanding.png" alt="Treasury debt held by the public as a share of GDP">
+</td>
+<td width="50%" valign="top">
+<b>Yield curve on two dates</b><br>
+Nominal constant-maturity curves overlaid for shape comparison. Table <code>yield_curve</code>.<br><br>
+<img src="docs/screenshots/us_yield_curve.png" alt="Nominal yield curve on two dates">
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<b>Statutory debt limit</b><br>
+Gaps in the line mark suspension periods. Table <code>debt_limit</code>.<br><br>
+<img src="docs/screenshots/us_debt_limit.png" alt="Statutory debt limit with suspension gaps">
+</td>
+<td width="50%" valign="top">
+<b>Average interest rate on Treasury debt</b><br>
+The rate the Treasury pays on outstanding marketable securities. Table <code>treasuries_average_yields</code>.<br><br>
+<img src="docs/screenshots/us_treasuries_average_interest_rates.png" alt="Average interest rate on marketable Treasury debt">
+</td>
+</tr>
+</table>
+
+### China
+
+<table>
+<tr>
+<td width="50%" valign="top">
+<b>Interest rate corridor</b><br>
+SLF 7-day ceiling, IOER floor, 7-day reverse repo rate and the FDR007 fixing. Tables <code>pboc_repo_fixing</code>, <code>pboc_omo</code> and <code>pboc_policy_rates</code>.<br><br>
+<img src="docs/screenshots/cn_shibor.png" alt="China interest rate corridor">
+</td>
+<td width="50%" valign="top">
+<b>PBOC balance sheet</b><br>
+Asset side: FX reserves, claims on government and claims on depository institutions. Table <code>pboc_balance_sheet</code>.<br><br>
+<img src="docs/screenshots/cn_balance_sheet.png" alt="PBOC balance sheet, asset side">
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<b>Kalecki profits equation, China</b><br>
+The same identity rebuilt annually from the NBS flow-of-funds accounts. Table <code>cn_flow_of_funds</code>.<br><br>
+<img src="docs/screenshots/cn_kalecki_equation.png" alt="Kalecki profits equation for China">
+</td>
+<td width="50%" valign="top">
+<b>Sectoral financial balances, China</b><br>
+Private, government and foreign net lending as a share of GDP. Table <code>cn_flow_of_funds</code>.<br><br>
+<img src="docs/screenshots/cn_three_sector_balance.png" alt="Three-sector financial balances for China">
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<b>Money supply</b><br>
+M1 and M2 growth with the M1 minus M2 gap shaded. Table <code>pboc_money_supply</code>.<br><br>
+<img src="docs/screenshots/cn_money_supply.png" alt="M1 and M2 growth with the gap shaded">
+</td>
+<td width="50%" valign="top">
+<b>Total social financing by component</b><br>
+Monthly flow, stacked by instrument. Table <code>pboc_social_financing</code>.<br><br>
+<img src="docs/screenshots/cn_social_financing.png" alt="Total social financing monthly flow by component">
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<b>70-city house prices</b><br>
+New-home index year on year, averaged by city tier. Table <code>nbs_house_price</code>.<br><br>
+<img src="docs/screenshots/cn_house_price.png" alt="70-city house price index by tier">
+</td>
+<td width="50%" valign="top">
+<b>Land transfer revenue</b><br>
+Cumulative year-to-date proceeds from land-use-right sales, by year. Table <code>mof_land_revenue</code>.<br><br>
+<img src="docs/screenshots/cn_land_revenue.png" alt="Land transfer revenue cumulative YTD by year">
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<b>Loan Prime Rate</b><br>
+1-year and 5-year-plus LPR. Table <code>pboc_lpr</code>.<br><br>
+<img src="docs/screenshots/cn_lpr.png" alt="Loan Prime Rate, 1-year and 5-year-plus">
+</td>
+<td width="50%" valign="top">
+<b>Required reserve ratio</b><br>
+Large and small-to-medium institutions, with the spread shaded. Table <code>pboc_rrr</code>.<br><br>
+<img src="docs/screenshots/cn_rrr.png" alt="Required reserve ratios for large and small institutions">
+</td>
+</tr>
+</table>
 
 ## Data sources
 
